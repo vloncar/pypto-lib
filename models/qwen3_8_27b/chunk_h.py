@@ -14,6 +14,13 @@ with S the state entering the chunk,
     S        = exp(g_last) * S + K^T (V_new * exp(g_last - g))
 
 Chunks carry state, so work is parallel over heads and sequential within one.
+
+`state` holds the snapshot ENTERING each chunk, which is what `chunk_o` reads. The state
+LEAVING the last chunk is what an inference cache carries forward, and
+`_gdn_chunk_h_final` writes that as well -- transposed to `[V, K]` and widened to FP32 --
+into a row of the pool `decode_delta_rule` reads. The decode state is FP32 because fp16
+does not survive a long rollout, and its value axis leads because that puts the
+recurrence's `sum_k` on the contiguous axis.
 """
 import pypto.language as pl
 import torch
@@ -28,6 +35,7 @@ from wy_fast import CHUNK_TILE, wy_fast_ref
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
 STATE_DYN = pl.dynamic("GDN_STATE_DYN")     # (T // CHUNK_TILE) * H * D, the snapshot rows
+FSTATE_DYN = pl.dynamic("GDN_FSTATE_DYN")   # rows of the decode state pool
 
 # model config
 H = QWEN3_8_27B.linear_num_value_heads      # value heads
@@ -37,10 +45,14 @@ GRP = H // HG                               # value heads sharing one key head
 KEY_WIDTH = HG * D
 VAL_WIDTH = H * D
 
+# tiling
+HANDOFF_TILE = 64       # value rows per transpose step of the decode hand-off
+
 # validation
 # One chunk, the cross-chunk recurrence, then eight chunks. The token count must be a
 # multiple of CHUNK_TILE.
 DEFAULT_CASES = (128, 256, 1024)
+FINAL_CASE = 256        # the hand-off body: two chunks, so the state it leaves is not the first
 BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 
@@ -111,6 +123,109 @@ def _gdn_chunk_h(
 
 gdn_chunk_h = pl.jit.inline(_gdn_chunk_h)
 gdn_chunk_h_test = pl.jit(_gdn_chunk_h)
+
+
+def _gdn_chunk_h_final(
+    k: pl.Tensor[[T_DYN, HG, D], pl.FP16],
+    w: pl.Tensor[[T_DYN, H, D], pl.FP16],
+    u: pl.Tensor[[T_DYN, H, D], pl.FP16],
+    g_sum: pl.Tensor[[H, T_DYN], pl.FP32],
+    state: pl.Out[pl.Tensor[[STATE_DYN, D], pl.FP16]],
+    v_new: pl.Out[pl.Tensor[[T_DYN, H, D], pl.FP16]],
+    state_row: pl.Tensor[[1], pl.INT32],
+    final_state: pl.InOut[pl.Tensor[[FSTATE_DYN, H, D, D], pl.FP32]],
+):
+    """As `_gdn_chunk_h`, plus the state leaving the last chunk into `final_state`.
+
+    `state_row` names the pool row this sequence owns, the same indirection
+    `decode_delta_rule` uses, so the hand-off is a write into the pool rather than a
+    copy of 3 MiB per sequence.
+    """
+    k.bind_dynamic(0, T_DYN)
+    w.bind_dynamic(0, T_DYN)
+    u.bind_dynamic(0, T_DYN)
+    g_sum.bind_dynamic(1, T_DYN)
+    state.bind_dynamic(0, STATE_DYN)
+    v_new.bind_dynamic(0, T_DYN)
+    final_state.bind_dynamic(0, FSTATE_DYN)
+    t_dim = pl.tensor.dim(k, 0)
+    k_flat = pl.reshape(k, [t_dim, KEY_WIDTH])
+    w_flat = pl.reshape(w, [t_dim, VAL_WIDTH])
+    u_flat = pl.reshape(u, [t_dim, VAL_WIDTH])
+    v_flat = pl.reshape(v_new, [t_dim, VAL_WIDTH])
+    # The pool is addressed through a flat view of the same buffer, as
+    # `decode_delta_rule` addresses it: a `[1, H, D, D]` subview would need a
+    # single-element row, which ptoas rejects on its 32-byte row alignment.
+    fs_2d = pl.reshape(final_state, [pl.tensor.dim(final_state, 0) * H * D, D])
+    fs_row = pl.cast(pl.read(state_row, [0]), pl.INDEX)
+    carry = pl.create_tensor([H * D, D], dtype=pl.FP32)
+    for hh in pl.spmd(H, name_hint="chunk_h",
+                      optimizations=[pl.cross_core_slot(slot_num=1),
+                                     pl.split(pl.SplitMode.UP_DOWN)]):
+        s0 = pl.full([D, D], dtype=pl.FP32, value=0.0)
+        for c, (s_cur,) in pl.range(t_dim // CHUNK_TILE, init_values=(s0,)):
+            t0 = c * CHUNK_TILE
+            row = (c * H + hh) * D
+            d0 = hh * D
+            # GQA: K comes from key head hh // GRP; W, U and the state are per
+            # value head.
+            dg0 = (hh // GRP) * D
+
+            s16 = pl.cast(s_cur, target_type=pl.FP16, mode="rint")
+            state[row : row + D, 0:D] = s16                 # state ENTERING this chunk
+
+            # coeff[i] = exp(g_last - g_i), decay = exp(g_last); both arguments <= 0
+            g_last = pl.read(g_sum, [hh, t0 + CHUNK_TILE - 1])
+            g_row = g_sum[hh : hh + 1, t0 : t0 + CHUNK_TILE]
+            zero_row = pl.full([1, CHUNK_TILE], dtype=pl.FP32, value=0.0)
+            neg_g = pl.sub(zero_row, g_row)
+            # exp before the [1,C]->[C,1] reshape, not after (pypto#2947)
+            coeff = pl.reshape(pl.exp(pl.add(neg_g, g_last)), [CHUNK_TILE, 1])
+            zero_d = pl.full([1, D], dtype=pl.FP32, value=0.0)
+            decay = pl.reshape(pl.exp(pl.add(zero_d, g_last)), [D, 1])
+
+            wc = w_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D]
+            ws = pl.matmul(wc, s16, out_dtype=pl.FP32)
+            uc = u_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D]
+            vc = pl.sub(pl.cast(uc, target_type=pl.FP32), ws)   # V_new = U - W @ S
+            vc16 = pl.cast(vc, target_type=pl.FP16, mode="rint")
+
+            # S = exp(g_last) * S + K^T @ (coeff * V_new). The decay goes on V, not
+            # on K: K^T (V c) == (K c)^T V. Under pl.split a matmul whose transposed
+            # operand came from the vector unit cannot be lowered (pypto#2902).
+            kc = k_flat[t0 : t0 + CHUNK_TILE, dg0 : dg0 + D]
+            vs = pl.row_expand_mul(vc, coeff)
+            vs16 = pl.cast(vs, target_type=pl.FP16, mode="rint")
+            kv = pl.matmul(kc, vs16, a_trans=True, out_dtype=pl.FP32)
+            s_next = pl.add(pl.row_expand_mul(s_cur, decay), kv)
+
+            v_flat[t0 : t0 + CHUNK_TILE, d0 : d0 + D] = vc16
+            s_end, = pl.yield_(s_next)
+
+        # The state the loop ends with, still [K, V] and still FP32, parked for the
+        # transpose pass below.
+        carry[hh * D : hh * D + D, 0:D] = s_end
+
+    # [K, V] -> [V, K] in a second pass, because `pl.split(UP_DOWN)` halves dim 0 and a
+    # transpose swaps it -- the compiler rejects the pair outright. The split is not
+    # optional above (the body needs 197632 B of a 188416 B buffer without it), so the
+    # transpose moves out instead. It costs one more pass over 3 MiB of FP32 per
+    # sequence, once, against a hand-off that happens once.
+    for hh2 in pl.spmd(H, name_hint="chunk_h_handoff"):
+        crow = hh2 * D
+        frow = (fs_row * H + hh2) * D
+        # In HANDOFF_TILE bands of the value axis: a whole head transposed at once
+        # needs three [D, D] FP32 tiles live, 196608 B of a 188416 B buffer, and a
+        # band of 64 value rows needs three of half that. `decode_delta_rule` tiles
+        # its own state the same way for the same reason.
+        for v0 in pl.range(0, D, HANDOFF_TILE):
+            band = pl.slice(carry, [D, HANDOFF_TILE], [crow, v0])
+            fs_2d[frow + v0 : frow + v0 + HANDOFF_TILE, 0:D] = pl.transpose(band, 0, 1)
+    return state, v_new, final_state
+
+
+gdn_chunk_h_final = pl.jit.inline(_gdn_chunk_h_final)
+gdn_chunk_h_final_test = pl.jit(_gdn_chunk_h_final)
 
 
 def chunk_h_ref(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g_sum: torch.Tensor,
@@ -198,6 +313,61 @@ def golden_gdn_chunk_h(tensors):
     tensors["v_new"].copy_(v_new)
 
 
+def build_final_tensor_specs(t: int = BENCH_SEQ, pool_rows: int = 4, state_row: int = 2):
+    """`build_tensor_specs` plus the decode pool and the row this sequence owns.
+
+    `state_row` defaults away from 0 so a kernel that ignored `state_row` and wrote row 0
+    would leave the gated row untouched and pass.
+    """
+    from golden import TensorSpec
+
+    def pool():
+        # Non-zero, so a row the kernel fails to write shows up as the fill rather than
+        # as a plausible zero state.
+        return torch.full((pool_rows, H, D, D), -1.0)
+
+    return build_tensor_specs(t=t) + [
+        TensorSpec("state_row", [1], torch.int32,
+                   init_value=lambda: torch.tensor([state_row], dtype=torch.int32)),
+        TensorSpec("final_state", [pool_rows, H, D, D], torch.float32, init_value=pool),
+    ]
+
+
+def golden_gdn_chunk_h_final(tensors):
+    """The snapshots and V_new as before, plus the hand-off transposed and widened."""
+    t, _, d = tensors["k"].shape
+    h = tensors["w"].shape[1]
+    chunk = t // (tensors["state"].shape[0] // (h * d))
+    state, v_new, final = chunk_h_ref(tensors["k"], tensors["w"], tensors["u"],
+                                      tensors["g_sum"].t(), chunk)
+    tensors["state"].copy_(flat_state(state))
+    tensors["v_new"].copy_(v_new)
+    # `chunk_h_ref` returns the hand-off as [H, K, V]; the decode pool holds [V, K].
+    row = int(tensors["state_row"][0])
+    tensors["final_state"][row] = final.transpose(-2, -1).to(tensors["final_state"].dtype)
+
+
+def compare_final_state(state_row: int):
+    """Score the row the kernel wrote, and prove it left the others alone.
+
+    A whole-pool norm would be diluted: with four rows and one written, three quarters of
+    the tensor is trivially equal. The untouched rows are also the control -- they carry
+    -1.0, which no state takes, so a kernel that ignored `state_row` shows up as a row
+    that should have been left alone and was not.
+    """
+    scored = frob_ok()
+
+    def compare(actual, expected, **kwargs):
+        ok, detail = scored(actual[state_row], expected[state_row], **kwargs)
+        others = [r for r in range(actual.shape[0]) if r != state_row]
+        if others and not bool((actual[others] == -1.0).all()):
+            return False, f"{detail}\n    rows {others} were written and should not have been"
+        return ok, detail
+
+    compare.__name__ = "compare_final_state"
+    return compare
+
+
 if __name__ == "__main__":
     import argparse
     from golden import run
@@ -207,6 +377,8 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=None, help="one shape instead of DEFAULT_CASES")
+    parser.add_argument("--final", action="store_true", default=False,
+                        help="only the body that also writes the hand-off state")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -214,24 +386,36 @@ if __name__ == "__main__":
     cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
     if args.seq_len and args.seq_len % CHUNK_TILE:
         parser.error(f"--seq-len must be a multiple of CHUNK_TILE={CHUNK_TILE}")
-    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
-        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
 
-    for t in cases:
-        print(f"[case] chunk_h T={t}", flush=True)
+    # Both bodies by default: the hand-off is a second program, not a branch inside the
+    # first, so the plain entry cannot cover it.
+    plan = [] if args.final else [
+        (f"chunk_h T={t}", t, gdn_chunk_h_test, build_tensor_specs, golden_gdn_chunk_h,
+         {"state": frob_ok(), "v_new": frob_ok()}) for t in cases]
+    plan += [
+        (f"chunk_h final T={t}", t, gdn_chunk_h_final_test, build_final_tensor_specs,
+         golden_gdn_chunk_h_final,
+         {"state": frob_ok(), "v_new": frob_ok(), "final_state": compare_final_state(2)})
+        for t in (cases if args.seq_len or args.final else [FINAL_CASE])]
+    if len(plan) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one program and one shape; "
+                     "name them with --seq-len and --final")
+
+    for label, t, fn, specs_fn, golden_fn, compare_fn in plan:
+        print(f"[case] {label}", flush=True)
         result = run(
-            fn=gdn_chunk_h_test,
-            specs=build_tensor_specs(t=t),
-            golden_fn=golden_gdn_chunk_h,
+            fn=fn,
+            specs=specs_fn(t=t),
+            golden_fn=golden_fn,
             golden_data=args.golden_data,
             runtime_dir=args.runtime_dir,
             save_data=args.save_data,
             config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
-            compare_fn={"state": frob_ok(), "v_new": frob_ok()},
+            compare_fn=compare_fn,
         )
         if not result.passed:
             if result.error:
                 print(result.error)
             # Stop at the first failure: one device failure poisons the chip run lane, so
             # every later case in this process reports a failure it did not cause.
-            raise SystemExit(f"FAILED at T={t}")
+            raise SystemExit(f"FAILED at {label}")

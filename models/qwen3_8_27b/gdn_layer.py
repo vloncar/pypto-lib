@@ -22,7 +22,8 @@ import torch
 
 from chunk_cumsum import CHUNK_TILE, DISPATCH_TOKENS, cumsum_ref, gdn_chunk_cumsum
 from chunk_h import chunk_h_ref, gdn_chunk_h
-from chunk_o import chunk_o_ref, gdn_chunk_o
+from chunk_o import chunk_o_ref
+from chunk_o_pipe import gdn_chunk_o_pipe
 from config import QWEN3_8_27B
 from reference import frob_ok, make_inputs, to_hT
 from scaled_dot_kkt import gdn_scaled_dot_kkt, kkt_ref
@@ -103,7 +104,7 @@ def _gdn_layer(
     v_new = pl.create_tensor([t_dim, H, D], dtype=pl.FP16)
     gdn_chunk_h(k, w, u, g_sum, state, v_new)
 
-    gdn_chunk_o(q, k, v_new, state, g_sum, tril, o_out)
+    gdn_chunk_o_pipe(q, k, v_new, state, g_sum, tril, o_out)
     return o_out
 
 

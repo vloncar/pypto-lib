@@ -225,7 +225,9 @@ typedef struct { unsigned char v; } float4_e2m1x2_t;
 #include <pto/pto-inst.hpp>
 #include <pto/common/constants.hpp>
 
-#if !defined(__CCE_AICORE__) && !defined(TMRGSORT_HPP)
+// pto-isa moved MrgSortExecutedNumList from TMrgSort.hpp into common/type.hpp,
+// so the old TMRGSORT_HPP guard alone lets this fallback redefine it.
+#if !defined(__CCE_AICORE__) && !defined(TMRGSORT_HPP) && !defined(_PTO_INCLUDE_NPU_TYPE_H_)
 namespace pto {
 struct MrgSortExecutedNumList {
     uint16_t mrgSortList0;

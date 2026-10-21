@@ -1,0 +1,218 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""The BF16 projection, for the weights the deployed checkpoint does not quantize:
+
+    y[m, n] = bf16( sum_k a[m, k] * w[n, k] )
+
+BF16 both sides, FP32 accumulation over a pipelined K loop, bf16 out. The
+A8W8 sibling is `a8w8_linear.py`; this is the same shape of kernel with no
+quantization on either operand and no dequantization epilogue.
+
+The weight keeps `nn.Linear`'s `[out, in]` layout and is read with
+`b_trans=True`, so the contraction axis is contiguous. A BF16 row of `k_tile`
+elements is `2 * k_tile` bytes, so `k_tile >= 256` covers a 512-byte L2 line --
+half the count its INT8 sibling needs for the same bytes, and the same reason
+its K tile cannot be 512: the L1 operands would want 786 KiB of a 512 KiB
+buffer.
+
+Qwen3.8-27B needs this for exactly one projection: the GDN block's `out_proj`,
+which Eco-Tech leaves in BF16 while quantizing every other linear in the
+layer. `contract.py` records that, and `GDN_STATE.md` records what quantizing
+it anyway would cost. Running this file exercises that shape.
+"""
+import pypto.language as pl
+
+from config import PREFILL_SEQ, QWEN3_8_27B
+
+# model config
+K = QWEN3_8_27B.value_width                 # contraction: H value heads of D
+N = QWEN3_8_27B.hidden_size                 # back to the residual stream
+T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+
+# tiling defaults; each instance overrides them
+M_TILE = 128            # token rows per output tile
+N_TILE = 128            # output channels per output tile
+K_TILE = 256            # contraction step; 256 BF16 columns is one L2 line
+M_GROUP = 8             # output tiles a block walks down the token axis
+N_GROUP = 2             # and across the channel axis
+
+
+def build_kernel(m: int, k: int, n: int, name: str = "bf16_linear",
+                 inline: bool = False, m_tile: int = M_TILE, n_tile: int = N_TILE,
+                 k_tile: int = K_TILE, m_group: int = M_GROUP, n_group: int = N_GROUP):
+    """The projection at one shape.
+
+    A block walks an `m_group` by `n_group` patch of output tiles rather than
+    one, for the reasons `a8w8_linear` gives: it keeps the operands off the bus
+    and it keeps the task count inside the runtime's ring heap. The inner loop
+    takes two n-tiles against one activation tile, so `n_group` must be even.
+    """
+    if m % m_tile or n % n_tile or k % k_tile:
+        raise ValueError(f"m={m} must be a multiple of m_tile={m_tile}, "
+                         f"n={n} of n_tile={n_tile}, k={k} of k_tile={k_tile}")
+    mb, nb = m // m_tile, n // n_tile
+    if mb % m_group or nb % n_group:
+        raise ValueError(f"the {mb}x{nb} output tiles must divide by the patch "
+                         f"{m_group}x{n_group}")
+    if n_group % 2:
+        raise ValueError(f"n_group={n_group} must be even: the inner loop pairs n-tiles")
+    mg, ng = mb // m_group, nb // n_group
+
+    @(pl.jit.inline if inline else pl.jit)
+    def gdn_bf16_linear(
+        a: pl.Tensor[[m, k], pl.BF16],
+        w: pl.Tensor[[n, k], pl.BF16],
+        y: pl.Out[pl.Tensor[[m, n], pl.BF16]],
+    ):
+        # slot_num=1: the ring is sized by the tile crossing cube to vector, here
+        # the FP32 accumulator, and two slots of it exceed the vector buffer
+        # (pypto#2903).
+        for blk in pl.spmd(mg * ng, name_hint=name,
+                           optimizations=[pl.cross_core_slot(slot_num=1)]):
+            pm = (blk % mg) * m_group
+            pn = (blk // mg) * n_group
+            for gm in pl.range(m_group):
+                m0 = (pm + gm) * m_tile
+                # n innermost: the activation tile is the one held across the
+                # inner loop, and it is the operand every tile in the row reads
+                for gn in pl.range(n_group // 2):
+                    n0 = (pn + 2 * gn) * n_tile
+                    n1 = n0 + n_tile
+                    acc0 = pl.create_tensor([m_tile, n_tile], dtype=pl.FP32)
+                    acc1 = pl.create_tensor([m_tile, n_tile], dtype=pl.FP32)
+                    for kb in pl.pipeline(0, k // k_tile, stage=2):
+                        k0 = kb * k_tile
+                        at = a[m0 : m0 + m_tile, k0 : k0 + k_tile]
+                        acc0 = pl.matmul_acc(acc0, at, w[n0 : n0 + n_tile, k0 : k0 + k_tile],
+                                             b_trans=True, init_cond=(kb == 0))
+                        acc1 = pl.matmul_acc(acc1, at, w[n1 : n1 + n_tile, k0 : k0 + k_tile],
+                                             b_trans=True, init_cond=(kb == 0))
+                    y[m0 : m0 + m_tile, n0 : n0 + n_tile] = pl.cast(
+                        acc0, target_type=pl.BF16, mode="rint")
+                    y[m0 : m0 + m_tile, n1 : n1 + n_tile] = pl.cast(
+                        acc1, target_type=pl.BF16, mode="rint")
+        return y
+
+    return gdn_bf16_linear
+
+
+# ---------------------------------------------------------------------------
+# Golden and references
+# ---------------------------------------------------------------------------
+
+
+def golden_y(a, w):
+    """The kernel's arithmetic in float64, in its order. -> float64 [M, N]."""
+    import a8w8_linear
+
+    a8w8_linear.host_torch_setup()
+    return a.double() @ w.double().t()
+
+
+def golden_fn(tensors):
+    import torch
+
+    tensors["y"].copy_(golden_y(tensors["a"], tensors["w"]).to(torch.bfloat16))
+
+
+# acceptance: the kernel accumulates in FP32 and writes BF16, the golden
+# accumulates in float64 and writes BF16, so the two differ by the accumulation
+# order over K and one rounding. A relative Frobenius bound is the right shape;
+# an element-wise one would measure cancellation in the contraction.
+MAX_REL = 5e-3
+MAX_ROW_REL = 2e-2
+
+
+def compare_y(actual, expected, **_kwargs):
+    """Whole-tensor and worst-row relative distance to the float64 golden."""
+    dev, ref = actual.double(), expected.double()
+    rel = float((dev - ref).norm() / ref.norm())
+    row = float(((dev - ref).norm(dim=-1) / ref.norm(dim=-1)).max())
+    detail = (f"[stats] y vs float64 golden: rel frob {rel:.3e} (gate {MAX_REL}), "
+              f"worst row {row:.3e} (gate {MAX_ROW_REL})")
+    print(detail, flush=True)
+    ok = rel <= MAX_REL and row <= MAX_ROW_REL
+    return ok, "" if ok else detail
+
+
+# ---------------------------------------------------------------------------
+# The GDN `out_proj` shape, which is the only place the model needs this kernel
+# ---------------------------------------------------------------------------
+
+
+def build_specs(t: int = T, k: int = K, n: int = N, weights: str | None = None):
+    """The projection's inputs: a real layer's BF16 `out_proj` when given one.
+
+    The activation is drawn rather than taken from the block chain. This file
+    measures and validates the projection itself; what the gated norm hands it
+    is `gdn_block`'s business, and `GDN_STATE.md` carries the composed pair.
+    """
+    import torch
+    from golden import TensorSpec
+
+    def draw(shape, seed, scale):
+        def make():
+            gen = torch.Generator().manual_seed(seed)
+            return (torch.randn(*shape, generator=gen) * scale).to(torch.bfloat16)
+        return make
+
+    def weight():
+        if weights is None:
+            return draw((n, k), 2, k ** -0.5)()
+        return torch.load(weights, weights_only=True)["out_proj.weight"]
+
+    return [
+        TensorSpec("a", [t, k], torch.bfloat16, init_value=draw((t, k), 1, k ** -0.5)),
+        TensorSpec("w", [n, k], torch.bfloat16, init_value=weight),
+        TensorSpec("y", [t, n], torch.bfloat16),
+    ]
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+
+    from golden import run
+
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--weights", type=str, default=None,
+                        help="a real GDN layer from weights.py; default: random weights")
+    parser.add_argument("--k-tile", type=int, default=K_TILE)
+    parser.add_argument("--m-group", type=int, default=M_GROUP)
+    parser.add_argument("--n-group", type=int, default=N_GROUP)
+    parser.add_argument("--rounds", type=int, default=0)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    args = parser.parse_args()
+    if args.rounds:
+        os.environ["PYPTO_BENCH"] = "1"
+        os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
+        os.environ["PYPTO_BENCH_WARMUP"] = "5"
+
+    result = run(
+        fn=build_kernel(args.seq_len, K, N, k_tile=args.k_tile,
+                        m_group=args.m_group, n_group=args.n_group),
+        specs=build_specs(t=args.seq_len, weights=args.weights),
+        golden_fn=golden_fn,
+        compare_fn={"y": compare_y},
+        golden_data=args.golden_data,
+        runtime_dir=args.runtime_dir,
+        save_data=args.save_data,
+        config=dict(platform=args.platform, device_id=args.device),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)
