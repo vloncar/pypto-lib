@@ -188,8 +188,8 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--max-pages", type=int, default=8)
@@ -200,7 +200,8 @@ if __name__ == "__main__":
         fn=build_kernel(max_pages=args.max_pages),
         specs=build_tensor_specs(batch=args.batch, max_pages=args.max_pages),
         golden_fn=golden_gdn_decode_kv_append(),
-        config=dict(platform=args.platform, device_id=args.device),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
+                    device_id=args.device),
         rtol=0.0,
         atol=0.0,
         compile_only=args.compile_only,

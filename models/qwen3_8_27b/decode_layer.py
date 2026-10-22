@@ -150,10 +150,11 @@ NORM_W_SCALE = 0.05
 LAYER_RING_HEAP = 256 * 1024 * 1024
 
 
-def run_config(platform: str = "a2a3", device: int = 0, swimlane: int = 0) -> dict:
+def run_config(backend_type: str = "a2a3", sim: bool = False, device: int = 0,
+               swimlane: int = 0) -> dict:
     """The config `golden.run` needs for either layer."""
-    return dict(platform=platform, device_id=device, ring_heap=LAYER_RING_HEAP,
-                enable_chip_swimlane=swimlane)
+    return dict(backend_type=backend_type, execution_mode=sim, device_id=device,
+                ring_heap=LAYER_RING_HEAP, enable_chip_swimlane=swimlane)
 
 
 def _parts(batch: int, norm_col_groups: int | None = NORM_COL_GROUPS,
@@ -595,8 +596,8 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--kind", type=str, default="gdn", choices=KINDS,
                         help="which mixer the layer is built around")
@@ -629,7 +630,8 @@ if __name__ == "__main__":
         specs=build_tensor_specs(args.kind, batch=args.batch, **paths, **spec_kwargs),
         golden_fn=golden_decode_layer(args.kind),
         compare_fn=compare_fns(args.kind),
-        config=run_config(args.platform, args.device, args.enable_chip_swimlane),
+        config=run_config(args.backend_type, args.execution_mode, args.device,
+                          args.enable_chip_swimlane),
         rtol=1e-2,
         atol=1e-2,
         compile_only=args.compile_only,

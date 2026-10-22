@@ -272,7 +272,8 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=None,
                         help=f"tokens; default {BENCH_SEQ} on hardware, {SIM_T} on the simulators")
@@ -293,7 +294,7 @@ if __name__ == "__main__":
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
     act_dtype = pl.FP32 if args.fp32_act else pl.BF16
-    seq_len = args.seq_len or (SIM_T if args.platform.endswith("sim") else BENCH_SEQ)
+    seq_len = args.seq_len or (SIM_T if args.execution_mode else BENCH_SEQ)
     m_group = args.m_group
     if (seq_len // M_TILE) % m_group:
         m_group = next(side for side in M_PREFER if (seq_len // M_TILE) % side == 0)
@@ -306,7 +307,8 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
+                    device_id=args.device),
         rtol=1e-2,
         atol=1e-2,
     )

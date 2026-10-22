@@ -396,7 +396,8 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--batch", type=int, default=4)
     parser.add_argument("--context", type=int, default=320)
@@ -424,7 +425,8 @@ if __name__ == "__main__":
         specs=build_tensor_specs(args.batch, args.context, max_pages),
         golden_fn=None if args.rounds else golden_fn,
         compile_only=args.compile_only,
-        config=dict(platform=args.platform, device_id=args.device),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
+                    device_id=args.device),
         rtol=2e-2, atol=2e-2,
         compare_fn=None if args.rounds else {"o": _rel_ok(6e-3, "o")},
     )

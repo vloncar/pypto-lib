@@ -612,14 +612,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     # Accepted and ignored: this is host-side, but CI invokes runnable model
     # files with one uniform platform/device command line.
-    parser.add_argument(
-        "-p",
-        "--platform",
-        type=str,
-        default="a2a3",
-        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
-        help="accepted for CI's uniform invocation; nothing here runs on device",
-    )
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3",
+                        help="accepted for CI's uniform invocation; nothing here runs on device")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true",
+                        help="accepted for CI's uniform invocation; unused")
     parser.add_argument(
         "-d",
         "--device",

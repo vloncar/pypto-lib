@@ -218,7 +218,8 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
     parser.add_argument("--rounds", type=int, default=0)
@@ -240,7 +241,8 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device, ring_heap=PIPE_RING_HEAP),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
+                    device_id=args.device, ring_heap=PIPE_RING_HEAP),
         rtol=1e-2,
         atol=1e-2,
     )

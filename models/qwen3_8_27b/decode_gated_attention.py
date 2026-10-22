@@ -96,10 +96,11 @@ def _qg_copy_tile(m: int) -> int:
     return tile
 
 
-def run_config(platform: str = "a2a3", device: int = 0, swimlane: int = 0) -> dict:
+def run_config(backend_type: str = "a2a3", sim: bool = False, device: int = 0,
+               swimlane: int = 0) -> dict:
     """The config `golden.run` needs for this mixer."""
-    return dict(platform=platform, device_id=device, ring_heap=BLOCK_RING_HEAP,
-                enable_chip_swimlane=swimlane)
+    return dict(backend_type=backend_type, execution_mode=sim, device_id=device,
+                ring_heap=BLOCK_RING_HEAP, enable_chip_swimlane=swimlane)
 
 
 def build_kernel(batch: int, max_pages: int, splits: int | None = None,
@@ -366,8 +367,8 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--context", type=int, default=320)
@@ -391,7 +392,8 @@ if __name__ == "__main__":
         compare_fn={"out": compare_out(),
                     "k_pages": compare_pages("k_pages"),
                     "v_pages": compare_pages("v_pages")},
-        config=run_config(args.platform, args.device, args.enable_chip_swimlane),
+        config=run_config(args.backend_type, args.execution_mode, args.device,
+                          args.enable_chip_swimlane),
         rtol=1e-2,
         atol=1e-2,
         compile_only=args.compile_only,

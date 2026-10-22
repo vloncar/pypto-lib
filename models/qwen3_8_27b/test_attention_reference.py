@@ -103,8 +103,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     # Accepted and ignored: this check is host-only, but CI invokes every runnable
     # file in a model directory with the common platform and device flags.
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"],
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3",
                         help="accepted for CI's uniform invocation; nothing here runs on device")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true",
+                        help="accepted for CI's uniform invocation; unused")
     parser.add_argument("-d", "--device", type=int, default=0, help="accepted for CI's uniform invocation; unused")
     parser.add_argument("--seq-len", type=int, default=67)
     parser.add_argument("--seed", type=int, default=42)
