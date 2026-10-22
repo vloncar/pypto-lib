@@ -21,9 +21,10 @@ The weight keeps `nn.Linear`'s `[out, in]` layout and is read with
 the K tile: an INT8 row of `k_tile` bytes should cover a 512-byte L2 line, so
 `k_tile >= 512`.
 
-The three instances live in `in_proj_qkv.py`, `in_proj_z.py` and `out_proj.py`,
-which supply the shape, the tiles, and where the weight and the reference come
-from.
+The two instances live in `in_proj_qkv.py` and `in_proj_z.py`, which supply
+the shape, the tiles, and where the weight and the reference come from; the
+attention projections and the MLP build their own. The block's `out_proj` is
+BF16 both sides and uses `bf16_linear.py` instead.
 """
 import pypto.language as pl
 

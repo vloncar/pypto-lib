@@ -16,8 +16,8 @@
     q, k, v      = short_conv(qkv)                depthwise causal conv, then silu
     q, k, beta, g = qk_norm_gate(q, k, a, b)      L2-norm, sigmoid, softplus
     o            = gdn_layer(q, k, v, g, beta)    the delta rule, six stages
-    y_q, y_scale = gated_rmsnorm(o, z)            the gated norm, int8 epilogue
-    out          = out_proj(y_q, y_scale)         6144 -> 5120, A8W8
+    y            = gated_rmsnorm(o, z)            the gated norm, bf16 out
+    out          = out_proj(y)                    6144 -> 5120, BF16 both sides
 
 Fourteen operators as one program. Everything between `x` and `out` is
 allocated here and never leaves.
@@ -32,21 +32,23 @@ the delta rule, is written in fp16 there rather than cast by a later pass. And
 `in_proj_ab` reads `x` in bf16 while everything else reads the quantised copy,
 which is the one place the block reads the hidden states twice.
 
-The dtype at each boundary is the one the standalone operators exchange, so
-this is numerically the chain `test_gdn_stages.py --chain` validates, with the
-same fp16 delta rule inside.
+The dtype at each boundary is the one the standalone operators exchange,
+with the same fp16 delta rule inside. `out_proj` is BF16 both sides because
+the deployed checkpoint leaves that one projection unquantized -- `contract.py`
+carries its published dtype -- so the block quantizes the hidden states and
+nothing else.
 """
 import pypto.language as pl
 
 import a8w8_linear
-from gated_rmsnorm import gdn_gated_rmsnorm
+import bf16_linear
+from gated_rmsnorm import gdn_gated_rmsnorm_bf16
 from gdn_layer import gdn_layer as gdn_layer_fn
 from in_proj_ab import gdn_in_proj_ab
 from qk_norm_gate import gdn_qk_norm_gate
 from quant_x import gdn_quant_x
 import in_proj_qkv
 import in_proj_z
-import out_proj
 import short_conv
 import solve_tril
 from chunk_cumsum import CHUNK_TILE
@@ -99,7 +101,7 @@ def build_kernel(t: int = BENCH_SEQ, h: int = H, hg: int = HG, d: int = D, chunk
                                         out_heads=hg, name="conv_k")
     op_conv_v = short_conv.build_kernel(**conv, c_off=2 * key_width, c_out=h * d,
                                         out_heads=h, out_dtype=pl.FP16, name="conv_v")
-    op_out = out_proj.build_kernel(t=t, inline=True)
+    op_out = bf16_linear.build_kernel(t, cv, c, name="out_proj", inline=True)
 
     @(pl.jit.inline if inline else pl.jit)
     def gdn_block(
@@ -113,8 +115,7 @@ def build_kernel(t: int = BENCH_SEQ, h: int = H, hg: int = HG, d: int = D, chunk
         a_log: pl.Tensor[[h], pl.BF16],
         dt_bias: pl.Tensor[[h], pl.BF16],
         norm_w: pl.Tensor[[d], pl.BF16],
-        w_out: pl.Tensor[[c, cv], pl.INT8],
-        w_out_scale: pl.Tensor[[c], pl.FP32],
+        w_out: pl.Tensor[[c, cv], pl.BF16],
         tril: pl.Tensor[[chunk, chunk], pl.FP32],
         mask_strict: pl.Tensor[[chunk, chunk], pl.FP32],
         eye: pl.Tensor[[chunk, chunk], pl.FP16],
@@ -159,11 +160,10 @@ def build_kernel(t: int = BENCH_SEQ, h: int = H, hg: int = HG, d: int = D, chunk
         gdn_layer_fn(q_n, k_n, v_conv, g, beta, tril, mask_strict, eye,
                  m_diag, m_low, o)
 
-        y_q = pl.create_tensor([t, cv], dtype=pl.INT8)
-        y_scale = pl.create_tensor([1, t], dtype=pl.FP32)
-        gdn_gated_rmsnorm(o, z, norm_w, y_q, y_scale)
+        y = pl.create_tensor([t, cv], dtype=pl.BF16)
+        gdn_gated_rmsnorm_bf16(o, z, norm_w, y)
 
-        op_out(y_q, y_scale, w_out, w_out_scale, out)
+        op_out(y, w_out, out)
         return out
 
     return gdn_block
@@ -188,7 +188,6 @@ def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, hg: int = HG, d: int = D,
 
     w_qkv, w_qkv_scale = quantized("in_proj_qkv")
     w_z, w_z_scale = quantized("in_proj_z")
-    w_out, w_out_scale = quantized("out_proj")
 
     def stacked_ab():
         w = block_weights()
@@ -220,8 +219,7 @@ def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, hg: int = HG, d: int = D,
         TensorSpec("a_log", [h], torch.bfloat16, init_value=param("A_log")),
         TensorSpec("dt_bias", [h], torch.bfloat16, init_value=param("dt_bias")),
         TensorSpec("norm_w", [d], torch.bfloat16, init_value=param("norm.weight")),
-        TensorSpec("w_out", [C, CV], torch.int8, init_value=w_out),
-        TensorSpec("w_out_scale", [C], torch.float32, init_value=w_out_scale),
+        TensorSpec("w_out", [C, CV], torch.bfloat16, init_value=param("out_proj.weight")),
         TensorSpec("tril", [chunk, chunk], torch.float32, init_value=init_tril),
         TensorSpec("mask_strict", [chunk, chunk], torch.float32, init_value=init_mask_strict),
         TensorSpec("eye", [chunk, chunk], torch.float16,
@@ -267,9 +265,12 @@ def _chain(t: int, weights: str | None, quant: bool, chunk: int = CHUNK_TILE):
             w = torch.load(weights, weights_only=True)
         if quant:
             w = reference.quantize_weights(w)
+        # `quant_y` stays off: the norm hands `out_proj` bf16, so there is no
+        # per-token quantisation of `y` to model, and `GDN_QUANT.weights` no
+        # longer names that weight either.
         _CHAIN_CACHE[key] = reference.block(
             reference.make_block_inputs(t, QWEN3_8_27B), w, QWEN3_8_27B, chunk,
-            quant_x=quant, quant_y=quant)
+            quant_x=quant, quant_y=False)
     return _CHAIN_CACHE[key]
 
 
@@ -292,12 +293,12 @@ def compare_out(t: int, weights: str | None):
     """Score the block against the float64 truth, beside what quantization alone costs.
 
     **Not** an element-wise gate against the fake-quant chain, which is the
-    obvious choice and the wrong one. `out_proj` reads int8, so a difference
-    far below the int8 step still flips values that sit near a rounding
-    boundary: the kernels' own dtypes move `y` by 2.6e-03, that flips 1.0% of
-    `y_q` by one step, and those flips alone move `out` by 1.4e-02. An
-    element-wise comparison after a quantization step measures which side of a
-    boundary a value landed on, not whether the kernel is right.
+    obvious choice and the wrong one. The block quantizes the hidden states
+    per token, so a difference far below the int8 step flips values sitting
+    near a rounding boundary and every projection downstream then reads a
+    different integer. An element-wise comparison after a quantization step
+    measures which side of a boundary a value landed on, not whether the
+    kernel is right.
 
     What is meaningful is how much the block adds to what W8A8 already costs,
     so both gates are ratios against the quantization floor and neither

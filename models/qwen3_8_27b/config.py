@@ -156,13 +156,16 @@ class GdnQuant:
 
     The `Eco-Tech/Qwen3.8-27B-w8a8` checkpoint uses the same per-output-channel weight
     and per-token activation min/max recipe, and stores zero `weight_offset` tensors
-    because the scheme is symmetric. Its GDN `out_proj` stays BF16, so the three names
-    below describe this tree's kernel path rather than the checkpoint's quantized set.
+    because the scheme is symmetric. Its GDN `out_proj` stays BF16 and so does ours,
+    so the two names below are both this tree's kernel path and the checkpoint's
+    quantized set for the block.
     """
 
     scale_max: float
     amax_eps: float
-    # Which projections are int8. `in_proj_a` and `in_proj_b` stay BF16: at 0.5 MB and
+    # Which projections are int8. `out_proj` is not among them: the checkpoint publishes
+    # it in BF16 (`contract.py`) and both mixers match it. `in_proj_a` and `in_proj_b` stay
+    # BF16 for a different reason: at 0.5 MB and
     # 0.1% of the FLOPs int8 there moves the block output by 3e-5, so BF16 costs nothing
     # (`test_block_reference.py --quant`). The convolution's 80 KB of taps likewise.
     weights: tuple[str, ...]
@@ -194,7 +197,7 @@ QWEN3_8_27B = Qwen38Config(
 GDN_QUANT = GdnQuant(
     scale_max=127.0,
     amax_eps=1e-4,
-    weights=("in_proj_qkv.weight", "in_proj_z.weight", "out_proj.weight"),
+    weights=("in_proj_qkv.weight", "in_proj_z.weight"),
 )
 
 

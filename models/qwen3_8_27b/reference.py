@@ -18,8 +18,8 @@ RMSNorm and `out_proj`, chained by :func:`block` from hidden states to hidden st
 checked against the model's own `Qwen3_5GatedDeltaNet` by `test_block_reference.py`.
 :func:`block` is two references in one -- on bf16 weights with no activation quantisation
 it is the float64 truth, how far a result is from the model; on int8 weights
-(:func:`quantize_weights`) with `quant_x` / `quant_y` it is the fake-quant reference the
-kernels are gated against.
+(:func:`quantize_weights`) with `quant_x` it is the fake-quant reference the kernels are
+gated against; `quant_y` prices quantising the block's last hand-off, which they do not.
 
 The model: :func:`text_prefill`, the embedding, both decoder-layer variants, dense
 SwiGLU, the residual paths, the final RMSNorm and the LM head, checked against
@@ -453,9 +453,10 @@ def block(x: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config,
     What you pass is what you get. bf16 weights compute the truth; int8 ones
     (:func:`quantize_weights`) are used at their dequantised values. *quant_x*
     quantises the hidden states per token before every projection reads them,
-    *quant_y* the normed output per token before `out_proj` -- the two
-    activation quantisations a W8A8 block performs, at the places the kernels
-    do them. The int8 tensors and fp32 scales come back as `x_q`, `x_scale`,
+    *quant_y* the normed output per token before `out_proj`. The kernels
+    quantise the hidden states only, `out_proj` being BF16 both sides, so
+    *quant_x* alone is the fake-quant reference they are gated against and
+    *quant_y* prices the alternative. The int8 tensors and fp32 scales come back as `x_q`, `x_scale`,
     `y_q`, `y_scale`, so a kernel can be checked at the quantised hand-off too.
     `y` is quantised from its fp32 rounding, as the norm kernel that produces
     it will hold it.

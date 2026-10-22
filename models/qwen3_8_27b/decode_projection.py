@@ -200,11 +200,6 @@ def padded_batch(batch: int) -> int:
 # it, and the GDN `out_proj` is the only projection in the model it applies to.
 BF16_MODULES = frozenset({"out_proj"})
 
-# What a fake-quant reference should quantise on the decode path, which is `GDN_QUANT.weights`
-# minus the one above. The config tuple still describes the Q4 kernel scheme, which the
-# prefill path implements until G4.1 makes the same change.
-DECODE_QUANT_WEIGHTS = ("in_proj_qkv.weight", "in_proj_z.weight")
-
 
 # a2a3's two on-chip buffers that a decode matmul grows into, because `m_tile` is the batch
 # (G5.6). They cap it, and both are reached at the same value.

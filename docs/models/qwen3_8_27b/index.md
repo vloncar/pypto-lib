@@ -25,7 +25,7 @@ against it without a translation table.
 | Short convolution | depthwise, kernel 4, over all 10240 q/k/v channels |
 | Chunk length | 128 — our tiling choice, not a model constant |
 | Platform | Ascend A2/A3 (`-p a2a3`); A5 through the daily job |
-| Quantization | W8A8 around the delta rule, which has none itself (no weights): int8 weights per output channel, int8 activations per token. `in_proj_qkv`, `in_proj_z` and `out_proj` are int8 both sides; `in_proj_a`, `in_proj_b` and the convolution taps stay bf16, where int8 would move the block output by 3e-5 and save nothing. Measured cost on the real layer at T = 8192: 3.0e-2 against the float64 truth, ten times the model's own bf16 rounding |
+| Quantization | W8A8 around the delta rule, which has none itself (no weights): int8 weights per output channel, int8 activations per token. `in_proj_qkv` and `in_proj_z` are int8 both sides; `out_proj` is BF16 both sides, matching the deployed checkpoint, so the block quantizes the hidden states and nothing else. `in_proj_a`, `in_proj_b` and the convolution taps stay bf16 as well, where int8 would move the block output by 3e-5 and save nothing. Measured cost on the real layer at T = 8192: 1.6e-2 against the float64 truth, where quantizing `out_proj` too costs 3.0e-2 |
 
 Grouped-query attention is the shape that matters here: value head `h` reads key
 head `h // 3`. q and k carry 16 heads; v, beta, the gate, the state and the
@@ -52,12 +52,12 @@ the block runs them.
 | [in_proj_ab.py](../../../models/qwen3_8_27b/in_proj_ab.py) | hidden states to `a` and `b`, the two fused into one bf16 matmul |
 | [short_conv.py](../../../models/qwen3_8_27b/short_conv.py) | the depthwise causal convolution over the q/k/v channels, with silu |
 | [qk_norm_gate.py](../../../models/qwen3_8_27b/qk_norm_gate.py) | the q/k L2-norm and scaling, and `beta` and the decay gate from the a/b projections |
-| [gated_rmsnorm.py](../../../models/qwen3_8_27b/gated_rmsnorm.py) | the gated RMSNorm after the delta rule, and the per-token INT8 quantisation `out_proj` reads |
-| [out_proj.py](../../../models/qwen3_8_27b/out_proj.py) | the normed output back to the residual stream, A8W8 |
+| [gated_rmsnorm.py](../../../models/qwen3_8_27b/gated_rmsnorm.py) | the gated RMSNorm after the delta rule, in bf16 for the block and with a per-token INT8 epilogue for an A8W8 reader |
+| [bf16_linear.py](../../../models/qwen3_8_27b/bf16_linear.py) | the normed output back to the residual stream, BF16 both sides |
 | [gdn_layer.py](../../../models/qwen3_8_27b/gdn_layer.py) | the delta rule's six stages as one program |
 | [gdn_block.py](../../../models/qwen3_8_27b/gdn_block.py) | all fourteen as one program, hidden states in and out |
 
-The three A8W8 projections are the same arithmetic at three shapes and share
+The two A8W8 projections are the same arithmetic at two shapes and share
 one implementation, [a8w8_linear.py](../../../models/qwen3_8_27b/a8w8_linear.py);
 each instance file supplies its shape, its tiles and where its weight and
 references come from.
@@ -117,16 +117,25 @@ re-measured 9378 us mean over 50 rounds on a later one.
 Most of it is at the head, where `in_proj_ab`, the halo fill, the gate half of
 `qk_norm_gate` and `chunk_cumsum` all run underneath `quant_x` for free.
 
-**Accuracy is scored as two ratios against the quantization floor, not as an
-element-wise tolerance**, because `out_proj` reads int8. The kernels' own
-dtypes move the normed output by 2.6e-03, that flips 1.0% of its int8 values
-by one step, and those flips alone move the block output by 1.4e-02 -- so an
-element-wise comparison taken after a quantiser measures which side of a
-rounding boundary a value fell on, not whether the kernel is right. The gate
-is instead: total relative error within 1.05x of what W8A8 alone costs, and
-worst token row within 1.25x. Measured **1.006x and 1.002x**, with the worst
-row the sharper of the two -- one dead row in 2048 moves the whole-tensor norm
-by 1.12x and the worst row by 10.6x.
+**Accuracy is scored as ratios against the quantization floor, not as an
+element-wise tolerance**, because the block quantizes the hidden states per
+token: a difference far below the int8 step flips values that sit near a
+rounding boundary, and every projection downstream then reads a different
+integer -- so an element-wise comparison taken after a quantiser measures
+which side of a boundary a value fell on, not whether the kernel is right.
+The gate is instead total relative error within 1.05x of what W8A8 alone
+costs and worst token row within 1.25x, plus the same two distances to the
+fake-quant chain itself. Measured at T = 2048 on random weights: **1.032x and
+1.094x**, and 0.272 of the floor away from the chain the kernels implement.
+The worst row is the sharper of the two -- one dead row in 2048 moves the
+whole-tensor norm by 1.12x and the worst row by 10.6x.
+
+Those ratios have a smaller denominator than they used to. The same
+measurement on the A8W8 `out_proj` reads 1.006x and 0.987x at a floor of
+4.50e-02, where the BF16 one sits at 1.99e-02: the kernels' own fp16 and bf16
+rounding is unchanged in absolute terms, so it is a larger fraction of a
+floor half the size. In absolute terms the block moved **closer** to the
+chain it implements, 1.88e-02 to 5.43e-03.
 
 Still out of scope here: variable-length batches (one sequence, `B = 1`), and
 everything in the layer outside the Gated DeltaNet block itself.
@@ -175,14 +184,14 @@ per (token, head) over the head dim, with the cast sequence the model's own
 `Qwen3_5RMSNormGated` uses: fp32 variance and rsqrt, narrow to the model dtype,
 apply the weight there, apply the gate in fp32.
 
-Its epilogue quantises the result per token, over the whole 6144-wide row,
-because that row is what `out_proj` multiplies: the kernel writes int8 plus one
-fp32 scale per token and the normed output never reaches GM in bf16. Pass
-`--bf16-out` for the same kernel ending in the module's own cast, which is what
-the epilogue is priced against.
+The block takes the form that ends in the module's own cast, `out_proj` being
+bf16 both sides. The file also carries an epilogue that quantises the result
+per token over the whole 6144-wide row -- what an A8W8 reader of this output
+needs, which is how the block read it before the BF16 `out_proj` -- and
+`--bf16-out` selects between the two.
 
-On a2a3 at T = 8192, 50 rounds: **643 us** with the int8 epilogue (391 GB/s of
-GM traffic) and **398 us** without (759 GB/s). The comparison is a `torch_npu`
+On a2a3 at T = 8192, 50 rounds: **398 us** for the bf16 form the block uses
+(759 GB/s of GM traffic) and **643 us** with the int8 epilogue (391 GB/s). The comparison is a `torch_npu`
 composition -- `npu_rms_norm`, eager silu and multiply, `npu_dynamic_quant`,
 there being no gated-norm op -- at 2584 and 2431 us, so 4.0x and 6.1x. Accuracy against the
 float64 reference is 3.3e-2 with the epilogue and 3.1e-3 without, so the
@@ -190,15 +199,17 @@ quantisation is the entire gap and the kernel adds nothing measurable to it.
 
 ## The projections
 
-The four projections around the delta rule are W8A8: int8 weights with one
-scale per output channel, int8 activations with one scale per token, INT32
-accumulation over a pipelined K loop, dequantised by the two scales and written
-as bf16.
+Two of the four projections around the delta rule are W8A8: `in_proj_qkv` and
+`in_proj_z`, with int8 weights at one scale per output channel, int8
+activations at one scale per token, INT32 accumulation over a pipelined K loop,
+dequantised by the two scales and written as bf16. The other two are bf16 --
+`in_proj_ab` because int8 there buys nothing (below), and `out_proj` because
+the deployed checkpoint publishes that weight unquantized.
 
 [quant_x.py](../../../models/qwen3_8_27b/quant_x.py) does the activation side
-once for everything that reads the hidden states. The gated norm does the same
-arithmetic on its own output in its epilogue rather than here, because that
-value never reaches GM in bf16.
+once for everything that reads the hidden states, and it is the block's only
+activation quantisation. The gated norm has the same arithmetic available in
+its own epilogue, for an A8W8 reader of its output; the block does not use it.
 
 [a8w8_linear.py](../../../models/qwen3_8_27b/a8w8_linear.py) is the matmul.
 Its one structural choice is that a block walks an `m_group` by `n_group`
@@ -230,15 +241,23 @@ On a2a3 at T = 8192, 50 rounds, against `torch_npu` 2.10.0 on the same card:
 | `in_proj_qkv` | 1813 | `npu_quant_matmul` | 1660 |
 | `in_proj_z` | 1014 | `npu_quant_matmul` | 993 |
 | `in_proj_ab` | 115 | `F.linear` bf16 | 47 |
-| `out_proj` | 1048 | `npu_quant_matmul` | 977 |
 
-The three GEMMs run at 474 to 508 INT8 TOPS, 1.70 to 1.73x their own bf16
-`F.linear` at the same shapes and 0.90x of CANN's dedicated W8A8 operator. A
+The two GEMMs run at 474 and 508 INT8 TOPS, about 1.7x their own bf16
+`F.linear` at the same shapes and 0.92 to 0.98x of CANN's dedicated W8A8
+operator. A
 control that drops the dequantisation entirely measures within the noise of the
 full kernel, so that gap is the cube schedule under a 128x128 output tile, not
 the epilogue. Accuracy: each GEMM sits 1.7e-03 from the float64 W8A8 chain it
 implements -- bf16 output rounding and nothing else -- and the quantisation is
 the whole of the rest.
+
+The block's `out_proj` left that table when it became BF16. One card, one
+grant, T = 8192, 50 rounds: **939 us** as A8W8 against **1996 us** through
+`bf16_linear`, 2.13x. That is the dtype and not the schedule -- 548 INT8 TOPS
+against 258 bf16 TFLOPS is the same 69 to 73% of each peak. On the composed
+block the same pair measures 9094.7 against 9731.9 us at T = 8192 and 5017.0
+against 5388.6 at T = 4096, so the BF16 projection costs **7.0 to 7.4% of the
+block** and buys the 1.9x smaller quantisation error above.
 
 ## Validating and benchmarking
 

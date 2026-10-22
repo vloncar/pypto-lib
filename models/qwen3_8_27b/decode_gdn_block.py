@@ -304,7 +304,7 @@ def _truth(batch: int, weights: str | None, quant: bool, seed: int = 11, first_r
     w = (reference.make_block_weights(QWEN3_8_27B) if weights is None
          else torch.load(weights, weights_only=True))
     if quant:
-        w = reference.quantize_weights(w, names=decode_projection.DECODE_QUANT_WEIGHTS)
+        w = reference.quantize_weights(w)
     rows = m + first_row
     gen = torch.Generator().manual_seed(seed)
     rowmap = (torch.randperm(rows - first_row, generator=gen)[:m] + first_row).tolist()

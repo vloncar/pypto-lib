@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Gated DeltaNet gated RMSNorm, and the per-token INT8 quantization out_proj reads:
+"""Gated DeltaNet gated RMSNorm, and the per-token INT8 quantization an A8W8 reader needs:
 
     n = bf16(o * rsqrt(mean(o^2) + eps))          per (token, head) over the head dim
     y = bf16(n * norm_w) * silu(z)                gate applied after the norm, in fp32
@@ -49,8 +49,8 @@ EARLY_RESOLVE = True
 TOK_TILE = 16           # tokens per block; 16 scalar scale writes fill one 64-byte line
 LANES = 16              # amax lanes the decode form publishes; 16 FP32 is one 64-byte line
 
-# `y_scale` is a [1, T] row and not a [T] vector: `out_proj` reshapes its slice
-# to the [M, 1] column it multiplies by, and a tile store must be 2-D anyway.
+# `y_scale` is a [1, T] row and not a [T] vector: an A8W8 projection reshapes its
+# slice to the [M, 1] column it multiplies by, and a tile store must be 2-D anyway.
 
 
 def _gdn_gated_rmsnorm(

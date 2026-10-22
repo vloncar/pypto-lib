@@ -70,9 +70,11 @@ QUANT_VARIANTS = (
     ("int8 weights only, activations exact", GDN_QUANT.weights, False, False),
     ("per-token int8 x only, weights exact", None, True, False),
     ("per-token int8 y only, weights exact", None, False, True),
-    ("W8A8 -- the scheme", GDN_QUANT.weights, True, True),
+    ("W8A8 -- the scheme", GDN_QUANT.weights, True, False),
+    ("W8A8 with out_proj int8 too, which the checkpoint does not do",
+     GDN_QUANT.weights + ("out_proj.weight",), True, True),
     ("W8A8 with in_proj_a/b int8 too",
-     GDN_QUANT.weights + ("in_proj_a.weight", "in_proj_b.weight"), True, True),
+     GDN_QUANT.weights + ("in_proj_a.weight", "in_proj_b.weight"), True, False),
 )
 
 # torch's CPU depthwise conv opens a parallel region per channel group, and the

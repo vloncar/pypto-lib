@@ -90,9 +90,8 @@ def build_kernel(t: int = BENCH_SEQ, inline: bool = False):
                                     m_tile=M_TILE, n_tile=N_TILE, k_tile=K_TILE,
                                     m_group=kv_m_group, n_group=2, ring_slots=RING_SLOTS)
     core_kv_tile, core_row_tile = attn_core.KV_TILE, attn_core.ROW_TILE
-    # o_proj is the same 6144 -> 5120 shape `out_proj.py` runs, and takes the
-    # same 8 x 2 patch: `_patch` would give 8 x 8, which leaves 40 blocks for
-    # 24 cores and measures 1186.8 us against 1056.5
+    # o_proj takes an 8 x 2 patch of output tiles: `_patch` would give 8 x 8,
+    # which leaves 40 blocks for 24 cores and measures 1186.8 us against 1056.5
     op_o = a8w8_linear.build_kernel(m=t, k=O_WIDTH, n=HIDDEN, name="o_proj", inline=True,
                                     m_tile=M_TILE, n_tile=N_TILE, k_tile=K_TILE,
                                     m_group=m_group, n_group=2, ring_slots=RING_SLOTS)
