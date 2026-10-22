@@ -32,6 +32,10 @@ T_DYN = pl.dynamic("T_DYN")                 # tokens
 HQ = QWEN3_8_27B.num_attention_heads    # query heads
 HKV = QWEN3_8_27B.num_key_value_heads   # KV heads
 D = QWEN3_8_27B.head_dim                # head dimension
+# validation
+# one KV step, then two. Sized so a case also finishes inside the simulator's
+# 20 s stall watchdog; the prefill shape comes from --seq-len.
+DEFAULT_CASES = (256, 512)
 BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # a5sim cannot compile the cross-core wait (pto-isa#612).
@@ -287,30 +291,32 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
 
-    import attn_core
-
-    seq_len = args.seq_len or (attn_core.SIM_T if args.execution_mode else BENCH_SEQ)
-    if seq_len % KV_TILE:
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if args.seq_len and args.seq_len % KV_TILE:
         parser.error(f"--seq-len must be a multiple of KV_TILE={KV_TILE}")
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
     compile_only = args.compile_only
-    result = run(
-        fn=qwen3_attn_core_pipe_test,
-        specs=build_tensor_specs(t=seq_len),
-        golden_fn=None if compile_only else golden_qwen3_attn_core_pipe,
-        compile_only=compile_only,
-        compare_fn=None if compile_only else {"out": compare_out},
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-        ),
-        rtol=1e-2,
-        atol=1e-2,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for seq_len in cases:
+        print(f"[case] attn_core_pipe T={seq_len}", flush=True)
+        result = run(
+            fn=qwen3_attn_core_pipe_test,
+            specs=build_tensor_specs(t=seq_len),
+            golden_fn=None if compile_only else golden_qwen3_attn_core_pipe,
+            compile_only=compile_only,
+            compare_fn=None if compile_only else {"out": compare_out},
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+            ),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED at T={seq_len}")

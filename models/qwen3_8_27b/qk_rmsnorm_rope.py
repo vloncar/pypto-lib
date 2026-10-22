@@ -31,6 +31,8 @@ HKV = QWEN3_8_27B.num_key_value_heads   # KV heads
 D = QWEN3_8_27B.head_dim                # head dimension, the norm's axis
 ROT = QWEN3_8_27B.rotary_dim            # leading dimensions RoPE rotates
 EPS = QWEN3_8_27B.rms_norm_eps
+# validation
+DEFAULT_CASES = (32, 64)
 BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # tiling
@@ -323,32 +325,38 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--eps", type=float, default=EPS)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
-    if args.seq_len % TOK_TILE:
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
+    if args.seq_len and args.seq_len % TOK_TILE:
         parser.error(f"--seq-len must be a multiple of TOK_TILE={TOK_TILE}")
 
-    result = run(
-        fn=qwen3_qk_rmsnorm_rope_test,
-        specs=build_tensor_specs(t=args.seq_len),
-        golden_fn=golden_qwen3_qk_rmsnorm_rope(args.eps),
-        compare_fn={"q_rot": compare_bf16, "k_rot": compare_bf16},
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-        ),
-        rtol=1e-2,
-        atol=1e-2,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for t in cases:
+        print(f"[case] qk_rmsnorm_rope T={t}", flush=True)
+        result = run(
+            fn=qwen3_qk_rmsnorm_rope_test,
+            specs=build_tensor_specs(t=t),
+            golden_fn=golden_qwen3_qk_rmsnorm_rope(args.eps),
+            compare_fn={"q_rot": compare_bf16, "k_rot": compare_bf16},
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+            ),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED at T={t}")

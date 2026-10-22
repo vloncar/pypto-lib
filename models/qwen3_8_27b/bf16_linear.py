@@ -33,6 +33,9 @@ from config import QWEN3_8_27B
 # model config
 K = QWEN3_8_27B.value_width                 # contraction: H value heads of D
 N = QWEN3_8_27B.hidden_size                 # back to the residual stream
+# validation
+# one block of M_GROUP * M_TILE token rows, then two.
+DEFAULT_CASES = (1024, 2048)
 BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # tiling defaults; each instance overrides them
@@ -184,7 +187,8 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--weights", type=str, default=None,
                         help="a real GDN layer from weights.py; default: random weights")
     parser.add_argument("--k-tile", type=int, default=K_TILE)
@@ -195,26 +199,33 @@ if __name__ == "__main__":
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if args.seq_len and args.seq_len % (args.m_group * M_TILE):
+        parser.error(f"--seq-len must be a multiple of m_group*M_TILE={args.m_group * M_TILE}")
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
     if args.rounds:
         os.environ["PYPTO_BENCH"] = "1"
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
-    result = run(
-        fn=build_kernel(args.seq_len, K, N, k_tile=args.k_tile,
-                        m_group=args.m_group, n_group=args.n_group),
-        specs=build_specs(t=args.seq_len, weights=args.weights),
-        golden_fn=golden_fn,
-        compare_fn={"y": compare_y},
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
-                    device_id=args.device),
-        rtol=1e-2,
-        atol=1e-2,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for t in cases:
+        print(f"[case] bf16_linear T={t}", flush=True)
+        result = run(
+            fn=build_kernel(t, K, N, k_tile=args.k_tile,
+                            m_group=args.m_group, n_group=args.n_group),
+            specs=build_specs(t=t, weights=args.weights),
+            golden_fn=golden_fn,
+            compare_fn={"y": compare_y},
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
+                        device_id=args.device),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED at T={t}")

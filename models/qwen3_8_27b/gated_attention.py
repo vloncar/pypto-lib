@@ -37,6 +37,8 @@ EPS = QWEN3_8_27B.rms_norm_eps
 QG_WIDTH = 2 * HQ * D           # q_proj: query and gate per head
 KV_WIDTH = HKV * D
 O_WIDTH = HQ * D
+# validation
+DEFAULT_CASES = (256, 512)
 BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # ci: no-sim
@@ -271,32 +273,40 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--weights", type=str, default=None,
                         help="one layer's BF16 self_attn tensors from weights.py; default: random weights")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if args.seq_len and args.seq_len % attn_core_pipe.KV_TILE:
+        parser.error(f"--seq-len must be a multiple of {attn_core_pipe.KV_TILE}")
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
 
-    result = run(
-        fn=build_kernel(t=args.seq_len),
-        specs=build_tensor_specs(t=args.seq_len, weights=args.weights),
-        golden_fn=golden_qwen3_gated_attention,
-        compare_fn={"out": compare_out()},
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-            ring_heap=ATTN_RING_HEAP,
-        ),
-        rtol=1e-2,
-        atol=1e-5,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for t in cases:
+        print(f"[case] gated_attention T={t}", flush=True)
+        result = run(
+            fn=build_kernel(t=t),
+            specs=build_tensor_specs(t=t, weights=args.weights),
+            golden_fn=golden_qwen3_gated_attention,
+            compare_fn={"out": compare_out()},
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+                ring_heap=ATTN_RING_HEAP,
+            ),
+            rtol=1e-2,
+            atol=1e-5,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED at T={t}")

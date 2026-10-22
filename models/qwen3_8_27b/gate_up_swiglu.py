@@ -53,11 +53,13 @@ from config import QWEN3_8_27B
 # model config
 HIDDEN = QWEN3_8_27B.hidden_size
 INTER = QWEN3_8_27B.intermediate_size
+# validation
+# one M_TILE of tokens, then two; the entry picks a patch side that divides.
+# A block's work scales with the patch side, and the simulators declare a stall
+# after 20 s without progress: 256 tokens measured 42 s there, so the simulator
+# leg of this entry does not finish and needs --compile-only.
+DEFAULT_CASES = (128, 256)
 BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
-# The simulators run each block as one task and their scheduler declares a
-# stall after 20 s without progress, which a full-width pair of projections
-# reaches well before it finishes. 256 tokens run the same code in 42 s.
-SIM_T = 256
 
 # tiling; the accumulator pair is (gate, up), so n_group has no parity rule
 M_TILE = 128            # token rows per output tile
@@ -276,7 +278,7 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=None,
-                        help=f"tokens; default {BENCH_SEQ} on hardware, {SIM_T} on the simulators")
+                        help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--fp32-act", action="store_true", default=False,
                         help="the control: no added rounding, and no storage saving")
     parser.add_argument("--weights", type=str, default=None,
@@ -294,25 +296,31 @@ if __name__ == "__main__":
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
     act_dtype = pl.FP32 if args.fp32_act else pl.BF16
-    seq_len = args.seq_len or (SIM_T if args.execution_mode else BENCH_SEQ)
-    m_group = args.m_group
-    if (seq_len // M_TILE) % m_group:
-        m_group = next(side for side in M_PREFER if (seq_len // M_TILE) % side == 0)
-    result = run(
-        fn=build_kernel(m=seq_len, m_group=m_group, n_group=args.n_group,
-                        act_dtype=act_dtype),
-        specs=build_tensor_specs(t=seq_len, act_dtype=act_dtype, weights=args.weights),
-        golden_fn=golden_gdn_gate_up_swiglu,
-        compare_fn={"act": compare_act},
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
-                    device_id=args.device),
-        rtol=1e-2,
-        atol=1e-2,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if args.seq_len and args.seq_len % M_TILE:
+        parser.error(f"--seq-len must be a multiple of M_TILE={M_TILE}")
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
+    for seq_len in cases:
+        print(f"[case] gate_up_swiglu T={seq_len}", flush=True)
+        m_group = args.m_group
+        if (seq_len // M_TILE) % m_group:
+            m_group = next(side for side in M_PREFER if (seq_len // M_TILE) % side == 0)
+        result = run(
+            fn=build_kernel(m=seq_len, m_group=m_group, n_group=args.n_group,
+                            act_dtype=act_dtype),
+            specs=build_tensor_specs(t=seq_len, act_dtype=act_dtype, weights=args.weights),
+            golden_fn=golden_gdn_gate_up_swiglu,
+            compare_fn={"act": compare_act},
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
+                        device_id=args.device),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED at T={seq_len}")

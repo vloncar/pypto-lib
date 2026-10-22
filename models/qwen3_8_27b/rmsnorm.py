@@ -28,6 +28,11 @@ T_DYN = pl.dynamic("T_DYN")  # T = B * S
 HIDDEN = QWEN3_8_27B.hidden_size            # the axis the norm reduces over
 HIDDEN_INV = 1.0 / HIDDEN
 EPS = QWEN3_8_27B.rms_norm_eps
+# validation
+# one TOK_TILE of tokens, then two, for the two prefill programs; the decode
+# fan-out is shaped by the padded batch, so it carries its own pair.
+DEFAULT_CASES = (64, 128)
+FANNED_CASES = (16, 32)
 BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # tiling
@@ -417,7 +422,8 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--mode", type=str, default="plain", choices=["plain", "residual", "fanned"],
                         help="the plain norm, the fused add-and-norm, or its decode fan-out")
-    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ, help="tokens, or the padded batch for --mode fanned")
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="one shape instead of DEFAULT_CASES; the padded batch for --mode fanned")
     parser.add_argument("--col-groups", type=int, default=COL_GROUPS, help="--mode fanned only")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
@@ -425,34 +431,47 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
     tile = DECODE_TOK_TILE if args.mode == "fanned" else TOK_TILE
-    if args.seq_len % tile:
+    if args.seq_len and args.seq_len % tile:
         parser.error(f"--seq-len must be a multiple of {tile} in --mode {args.mode}")
-
-    if args.mode == "plain":
-        entry = dict(fn=qwen3_rmsnorm_test, specs=build_tensor_specs(t=args.seq_len),
-                     golden_fn=golden_qwen3_rmsnorm, compare_fn=None)
+    if args.seq_len:
+        plan = [(args.mode, args.seq_len)]
+    elif args.mode == "fanned":
+        plan = [("fanned", m) for m in FANNED_CASES]
+    elif args.mode == "residual":
+        plan = [("residual", m) for m in DEFAULT_CASES]
     else:
-        fn = (qwen3_residual_rmsnorm_test if args.mode == "residual"
-              else build_fanned_residual_kernel(args.seq_len, col_groups=args.col_groups))
-        entry = dict(fn=fn, specs=build_residual_tensor_specs(t=args.seq_len),
-                     golden_fn=golden_qwen3_residual_rmsnorm,
-                     compare_fn={"residual_out": compare_residual_out(), "y": compare_y()})
+        plan = [("plain", m) for m in DEFAULT_CASES]
+        plan += [("residual", DEFAULT_CASES[0]), ("fanned", FANNED_CASES[0])]
+    if len(plan) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
 
-    result = run(
-        **entry,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-        ),
-        rtol=1e-2,
-        atol=1e-5,
-        compile_only=args.compile_only,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+
+    for mode, m in plan:
+        print(f"[case] rmsnorm {mode} T={m}", flush=True)
+        if mode == "plain":
+            entry = dict(fn=qwen3_rmsnorm_test, specs=build_tensor_specs(t=m),
+                         golden_fn=golden_qwen3_rmsnorm, compare_fn=None)
+        else:
+            fn = (qwen3_residual_rmsnorm_test if mode == "residual"
+                  else build_fanned_residual_kernel(m, col_groups=args.col_groups))
+            entry = dict(fn=fn, specs=build_residual_tensor_specs(t=m),
+                         golden_fn=golden_qwen3_residual_rmsnorm,
+                         compare_fn={"residual_out": compare_residual_out(), "y": compare_y()})
+        result = run(
+            **entry,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+            ),
+            rtol=1e-2,
+            atol=1e-5,
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED in --mode {mode} at T={m}")

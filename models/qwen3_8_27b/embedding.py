@@ -23,6 +23,8 @@ T_DYN = pl.dynamic("T_DYN")                 # tokens
 # model config
 HIDDEN = QWEN3_8_27B.hidden_size
 VOCAB = QWEN3_8_27B.vocab_size
+# validation
+DEFAULT_CASES = (64, 128)
 BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # tiling
@@ -120,29 +122,35 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--vocab", type=int, default=VOCAB)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
 
-    result = run(
-        fn=qwen3_embedding_test,
-        specs=build_tensor_specs(t=args.seq_len, vocab=args.vocab),
-        golden_fn=golden_qwen3_embedding,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-        ),
-        rtol=0,
-        atol=0,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for t in cases:
+        print(f"[case] embedding T={t}", flush=True)
+        result = run(
+            fn=qwen3_embedding_test,
+            specs=build_tensor_specs(t=t, vocab=args.vocab),
+            golden_fn=golden_qwen3_embedding,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+            ),
+            rtol=0,
+            atol=0,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED at T={t}")

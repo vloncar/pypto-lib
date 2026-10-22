@@ -25,12 +25,13 @@ T_DYN = pl.dynamic("T_DYN")                 # tokens
 HQ = QWEN3_8_27B.num_attention_heads    # query heads
 HKV = QWEN3_8_27B.num_key_value_heads   # KV heads
 D = QWEN3_8_27B.head_dim                # head dimension
+# validation
+# one KV step, then two. The simulators run the whole core as one task and
+# declare a stall after 20 s without progress, which T = 8192 reaches long
+# before the kernel finishes; 1024 ran the same code in 15 s, so these cases
+# are well inside it. The prefill shape comes from --seq-len.
+DEFAULT_CASES = (128, 256)
 BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
-# The simulators run the whole core as one task, and their scheduler declares a
-# stall after 20 s without progress: at T = 8192 that kills the run long before
-# the simulated kernel finishes. 1024 runs the same code -- both diagonal
-# offsets and the tiles below them, every head -- in 15 s.
-SIM_T = 1024
 
 # tiling
 # The PV product is ROW_TILE * D * 4 bytes of the 128 KiB accumulator buffer,
@@ -224,32 +225,36 @@ if __name__ == "__main__":
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=None,
-                        help=f"tokens; default {BENCH_SEQ} on hardware, {SIM_T} on the simulators")
+                        help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
 
-    t = args.seq_len or (SIM_T if args.execution_mode else BENCH_SEQ)
-    if t % KV_TILE:
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if args.seq_len and args.seq_len % KV_TILE:
         parser.error(f"--seq-len must be a multiple of KV_TILE={KV_TILE}")
-    result = run(
-        fn=qwen3_attn_core_test,
-        specs=build_tensor_specs(t=t),
-        golden_fn=golden_qwen3_attn_core,
-        compare_fn={"out": compare_out},
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-        ),
-        rtol=1e-2,
-        atol=1e-2,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
+    for t in cases:
+        print(f"[case] attn_core T={t}", flush=True)
+        result = run(
+            fn=qwen3_attn_core_test,
+            specs=build_tensor_specs(t=t),
+            golden_fn=golden_qwen3_attn_core,
+            compare_fn={"out": compare_out},
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+            ),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED at T={t}")
