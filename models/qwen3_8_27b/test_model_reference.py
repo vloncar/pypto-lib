@@ -254,13 +254,7 @@ def main() -> int:
                         help="accepted for CI's uniform invocation; nothing here runs on device")
     parser.add_argument("--sim", dest="execution_mode", action="store_true",
                         help="accepted for CI's uniform invocation; unused")
-    parser.add_argument(
-        "-d",
-        "--device",
-        type=int,
-        default=0,
-        help="accepted for CI's uniform invocation; unused",
-    )
+    parser.add_argument("-d", "--device", type=int, default=0, help="accepted for CI's uniform invocation; unused")
     parser.add_argument("--seq-len", type=int, default=7)
     parser.add_argument("--chunk", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)

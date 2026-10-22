@@ -37,7 +37,7 @@ VAL_WIDTH = H * D
 DEFAULT_CASES = (128, 256)
 BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
-# a5sim cannot compile the cross-core wait (pto-isa#612).
+# a5sim cannot compile the cross-core wait (pto-isa#612), so --platform a5 compiles only.
 
 # tiling
 AIV_LANES = 2           # vector lanes per cube core, each owning half the chunk rows
@@ -238,6 +238,7 @@ if __name__ == "__main__":
         parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
     if args.seq_len and args.seq_len % CHUNK_TILE:
         parser.error(f"--seq-len must be a multiple of CHUNK_TILE={CHUNK_TILE}")
+    compile_only = args.compile_only or args.backend_type == "a5"
     if args.rounds:
         os.environ["PYPTO_BENCH"] = "1"
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
@@ -248,7 +249,7 @@ if __name__ == "__main__":
         result = run(
             fn=gdn_chunk_o_pipe_test,
             specs=build_tensor_specs(t=t),
-            golden_fn=golden_gdn_chunk_o_pipe,
+            golden_fn=None if compile_only else golden_gdn_chunk_o_pipe,
             golden_data=args.golden_data,
             runtime_dir=args.runtime_dir,
             save_data=args.save_data,
@@ -256,7 +257,7 @@ if __name__ == "__main__":
                         device_id=args.device, ring_heap=PIPE_RING_HEAP),
             rtol=1e-2,
             atol=1e-2,
-            compile_only=args.compile_only,
+            compile_only=compile_only,
         )
         if not result.passed:
             if result.error:

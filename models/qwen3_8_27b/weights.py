@@ -616,59 +616,27 @@ def main() -> int:
                         help="accepted for CI's uniform invocation; nothing here runs on device")
     parser.add_argument("--sim", dest="execution_mode", action="store_true",
                         help="accepted for CI's uniform invocation; unused")
-    parser.add_argument(
-        "-d",
-        "--device",
-        type=int,
-        default=0,
-        help="accepted for CI's uniform invocation; unused",
-    )
+    parser.add_argument("-d", "--device", type=int, default=0, help="accepted for CI's uniform invocation; unused")
     checkpoint_mode = parser.add_mutually_exclusive_group()
-    checkpoint_mode.add_argument(
-        "--fetch-checkpoint",
-        action="store_true",
-        help="download the pinned ~30 GiB Eco-Tech W8A8 checkpoint",
-    )
-    checkpoint_mode.add_argument(
-        "--validate-checkpoint",
-        action="store_true",
-        help="validate an already downloaded checkpoint index and shard set",
-    )
-    checkpoint_mode.add_argument(
-        "--verify-index",
-        action="store_true",
-        help="check the contract against the published checkpoint's index and "
-        "safetensors headers; needs the network, downloads no weights",
-    )
-    parser.add_argument(
-        "--checkpoint-dir",
-        type=str,
-        default=None,
-        help="Eco-Tech checkpoint directory (default under build_output/qwen3_8_27b)",
-    )
+    checkpoint_mode.add_argument("--fetch-checkpoint", action="store_true",
+                                 help="download the pinned ~30 GiB Eco-Tech W8A8 checkpoint")
+    checkpoint_mode.add_argument("--validate-checkpoint", action="store_true",
+                                 help="validate an already downloaded checkpoint index and shard set")
+    checkpoint_mode.add_argument("--verify-index", action="store_true",
+                                 help="check the contract against the published checkpoint's index and "
+                                 "safetensors headers; needs the network, downloads no weights")
+    parser.add_argument("--checkpoint-dir", type=str, default=None,
+                        help="Eco-Tech checkpoint directory (default under build_output/qwen3_8_27b)")
     parser.add_argument("--checkpoint-revision", type=str, default=ECO_REVISION)
 
     # Legacy one-layer options retained for Q0-Q4 validation.
-    parser.add_argument(
-        "--fetch",
-        action="store_true",
-        help="download one official BF16 GDN layer if absent",
-    )
+    parser.add_argument("--fetch", action="store_true", help="download one official BF16 GDN layer if absent")
     parser.add_argument("--layer", type=int, default=0)
-    parser.add_argument(
-        "--mixer",
-        type=str,
-        default="linear_attn",
-        choices=MIXERS,
-        help="which group of the layer's tensors to fetch: a mixer, the MLP, or the two layer norms",
-    )
+    parser.add_argument("--mixer", type=str, default="linear_attn", choices=MIXERS,
+                        help="which group of the layer's tensors to fetch: a mixer, the MLP, or the two layer norms")
     parser.add_argument("--out", type=str, default=None)
     parser.add_argument("--revision", type=str, default=BF16_REVISION)
-    parser.add_argument(
-        "--quantize",
-        action="store_true",
-        help="write the legacy layer's Q4 W8A8 form",
-    )
+    parser.add_argument("--quantize", action="store_true", help="write the legacy layer's Q4 W8A8 form")
     args = parser.parse_args()
 
     checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else default_checkpoint_path()
