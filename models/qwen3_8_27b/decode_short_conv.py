@@ -99,6 +99,10 @@ EARLY_RESOLVE = True
 KEY_WIDTH = HG * D                              # q, then k, then v along the channel axis
 VAL_WIDTH = H * D
 
+# validation
+# one token, then several; a token is one state row of the pool.
+DEFAULT_CASES = (1, 5)
+
 # tiling
 C_TILE = 2048           # channels per task: the widest that does not straddle q/k/v
 TOK_TILE = 4            # tokens one task walks; see the table above
@@ -280,8 +284,8 @@ def _rel_ok(threshold: float, label: str):
         rel = float(num / den) if float(den) > 0 else float(num)
         peak = float((actual.double() - expected.double()).abs().max())
         detail = f"{label} rel {rel:.3e} (<= {threshold:.0e}), peak abs {peak:.3e}"
-        print(f"[stats] {detail}", flush=True)
-        return rel <= threshold, detail
+        ok = rel <= threshold
+        return ok, "" if ok else detail
 
     return compare
 
@@ -296,7 +300,8 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--tokens", type=int, default=5)
+    parser.add_argument("--tokens", type=int, default=None,
+                        help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--pool-rows", type=int, default=POOL_ROWS)
     parser.add_argument("--c-tile", type=int, default=C_TILE)
     parser.add_argument("--tok-tile", type=int, default=TOK_TILE)
@@ -305,34 +310,38 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
-    if args.tokens > args.pool_rows:
-        parser.error("--tokens must not exceed --pool-rows; one token per state row")
+    cases = [args.tokens] if args.tokens else list(DEFAULT_CASES)
+    if max(cases) > args.pool_rows:
+        parser.error(f"--tokens {max(cases)} must not exceed --pool-rows {args.pool_rows}; "
+                     "one token per state row")
     torch.set_num_threads(min(torch.get_num_threads(), 32))
     torch.backends.mkldnn.enabled = False
 
     _, fn = build_kernel(args.c_tile, args.tok_tile)
-    result = run(
-        fn=fn,
-        specs=build_tensor_specs(tokens=args.tokens, pool_rows=args.pool_rows),
-        golden_fn=golden_gdn_decode_short_conv,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        compile_only=args.compile_only,
-        config=dict(
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-        ),
-        rtol=2e-2,
-        atol=2e-2,
-        # The window shift must be exact: it moves BF16 rows, so anything but 0 is a
-        # layout or ordering bug, not rounding.
-        compare_fn={"conv_state": _rel_ok(0.0, "conv_state"),
-                    "q": _rel_ok(6e-3, "q"), "k": _rel_ok(6e-3, "k"),
-                    "v": _rel_ok(6e-3, "v")},
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for tokens in cases:
+        print(f"[case] decode_short_conv tokens={tokens}", flush=True)
+        result = run(
+            fn=fn,
+            specs=build_tensor_specs(tokens=tokens, pool_rows=args.pool_rows),
+            golden_fn=golden_gdn_decode_short_conv,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            compile_only=args.compile_only,
+            config=dict(
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+            ),
+            rtol=2e-2,
+            atol=2e-2,
+            # The window shift must be exact: it moves BF16 rows, so anything but 0 is a
+            # layout or ordering bug, not rounding.
+            compare_fn={"conv_state": _rel_ok(0.0, "conv_state"),
+                        "q": _rel_ok(6e-3, "q"), "k": _rel_ok(6e-3, "k"),
+                        "v": _rel_ok(6e-3, "v")},
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED at tokens={tokens}")

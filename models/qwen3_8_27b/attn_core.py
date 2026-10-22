@@ -198,7 +198,6 @@ def compare_out(actual, expected, **_kwargs):
     peak = float((dev - ref).abs().max())
     detail = (f"[stats] out vs golden: rel frob {rel:.3e} (gate {MAX_REL}), worst row {row:.3e} "
               f"(gate {MAX_ROW_REL}), max abs {peak:.3e}")
-    print(detail, flush=True)
     ok = rel <= MAX_REL and row <= MAX_ROW_REL
     return ok, "" if ok else detail
 
@@ -229,6 +228,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
 
     cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
@@ -253,6 +253,7 @@ if __name__ == "__main__":
             ),
             rtol=1e-2,
             atol=1e-2,
+            compile_only=args.compile_only,
         )
         if not result.passed:
             if result.error:

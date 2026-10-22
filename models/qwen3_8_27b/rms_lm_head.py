@@ -43,6 +43,10 @@ VOCAB = QWEN3_8_27B.vocab_size
 EPS = QWEN3_8_27B.rms_norm_eps
 
 # case shape
+# validation
+# one sequence, then a full ROW_TILE of them. The row extent is padded up to the tile
+# and only the store is trimmed, so one row is a real case and not a degenerate one.
+DEFAULT_CASES = (1, 16)
 ROWS = 16               # rows logits are produced for; one per sequence
 
 # tiling
@@ -250,10 +254,11 @@ def compare_logits():
         frob = float((a - e).norm() / e.norm())
         diff = (a - e).abs()
         over = int((diff > 1e-4 + 1e-2 * e.abs()).sum())
-        print(f"[stats] logits rel frobenius {frob:.3e} (gate {FROB_GATE:.0e}); "
-              f"max abs {float(diff.max()):.3e}; {over} of {a.numel()} outside a fixed "
-              f"atol=1e-4 rtol=1e-2", flush=True)
-        return frob <= FROB_GATE, f"rel frobenius {frob:.3e} (<= {FROB_GATE:.0e})"
+        ok = frob <= FROB_GATE
+        detail = (f"rel frobenius {frob:.3e} (gate {FROB_GATE:.0e}); max abs "
+                  f"{float(diff.max()):.3e}; {over} of {a.numel()} outside a fixed "
+                  f"atol=1e-4 rtol=1e-2")
+        return ok, "" if ok else detail
 
     return compare
 
@@ -267,31 +272,39 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--rows", type=int, default=ROWS)
+    parser.add_argument("--rows", type=int, default=None,
+                        help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--eps", type=float, default=EPS)
     parser.add_argument("--vocab", type=int, default=VOCAB)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
+    cases = [args.rows] if args.rows else list(DEFAULT_CASES)
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --rows")
 
-    result = run(
-        fn=qwen3_rms_lm_head_test,
-        specs=build_tensor_specs(rows=args.rows, vocab=args.vocab),
-        golden_fn=golden_qwen3_rms_lm_head(args.eps),
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(
-            backend_type=args.backend_type,
-            execution_mode=args.execution_mode,
-            device_id=args.device,
-        ),
-        rtol=1e-2,
-        atol=1e-4,
-        compare_fn={"logits": compare_logits()},
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for rows in cases:
+        print(f"[case] rms_lm_head rows={rows}", flush=True)
+        result = run(
+            fn=qwen3_rms_lm_head_test,
+            specs=build_tensor_specs(rows=rows, vocab=args.vocab),
+            golden_fn=golden_qwen3_rms_lm_head(args.eps),
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(
+                backend_type=args.backend_type,
+                execution_mode=args.execution_mode,
+                device_id=args.device,
+            ),
+            rtol=1e-2,
+            atol=1e-4,
+            compare_fn={"logits": compare_logits()},
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED at rows={rows}")

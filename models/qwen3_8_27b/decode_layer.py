@@ -138,6 +138,10 @@ HEAD_DIM = decode_gated_attention.D
 ROT = decode_gated_attention.ROT
 PAGE = decode_kv_append.PAGE
 
+# validation
+# one padded decode batch, then two, for whichever mixer --kind selects.
+DEFAULT_CASES = (16, 32)
+
 # tiling: each stage's own decode value, and `decode_vector` carries the norm's
 NORM_COL_GROUPS = rmsnorm.COL_GROUPS    # column groups of each add-and-norm (G5.26)
 NORM_TOK_TILE = rmsnorm.DECODE_TOK_TILE     # the unfanned form's tiles, for the A/B above
@@ -147,14 +151,12 @@ NORM_K_TILE = rmsnorm.K_TILE
 # layer 0's two have standard deviations of 0.042 and 0.037.
 NORM_W_SCALE = 0.05
 
-LAYER_RING_HEAP = 256 * 1024 * 1024
-
 
 def run_config(backend_type: str = "a2a3", sim: bool = False, device: int = 0,
                swimlane: int = 0) -> dict:
     """The config `golden.run` needs for either layer."""
     return dict(backend_type=backend_type, execution_mode=sim, device_id=device,
-                ring_heap=LAYER_RING_HEAP, enable_chip_swimlane=swimlane)
+                enable_chip_swimlane=swimlane)
 
 
 def _parts(batch: int, norm_col_groups: int | None = NORM_COL_GROUPS,
@@ -307,7 +309,7 @@ def build_kernel(kind: str, batch: int, **kwargs):
     raise ValueError(f"kind must be one of {KINDS}, got {kind!r}")
 
 
-__all__ = ["KINDS", "LAYER_RING_HEAP", "build_attn_kernel", "build_gdn_kernel",
+__all__ = ["KINDS", "build_attn_kernel", "build_gdn_kernel",
            "build_kernel", "build_tensor_specs", "compare_fns", "gdn_weights",
            "golden_decode_layer", "mixer_oracle", "real_layer_paths", "run_config", "truth"]
 
@@ -558,7 +560,6 @@ def compare_vs_floor(name: str):
                 f"{got_row:.3e} against {floor_row:.3e} ({ratio_row:.3f}x); {vs_fq:.3e} vs "
                 f"the fake-quant chain ({fq_ratio:.3f} of the floor, worst row "
                 f"{fq_ratio_row:.3f})")
-        print(line, flush=True)
         ok = (ratio <= MAX_OVER_FLOOR and ratio_row <= MAX_ROW_OVER_FLOOR
               and fq_ratio <= MAX_VS_GOLDEN and fq_ratio_row <= MAX_ROW_VS_GOLDEN)
         return ok, "" if ok else line
@@ -601,7 +602,8 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--kind", type=str, default="gdn", choices=KINDS,
                         help="which mixer the layer is built around")
-    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--batch", type=int, default=None,
+                        help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--head-tile", type=int, default=decode_gdn_block.HEAD_TILE,
                         help="gdn only: delta-rule head states per task")
     parser.add_argument("--context", type=int, default=320,
@@ -615,6 +617,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0,
                         choices=range(5))
     args = parser.parse_args()
+    cases = [args.batch] if args.batch else list(DEFAULT_CASES)
 
     paths = real_layer_paths(args.real_layer, args.kind) if args.real_layer is not None else {}
     build_kwargs, spec_kwargs = {}, {}
@@ -625,18 +628,20 @@ if __name__ == "__main__":
         build_kwargs.update(max_pages=max_pages, splits=args.splits)
         spec_kwargs.update(context=args.context, max_pages=max_pages)
 
-    result = run(
-        fn=build_kernel(args.kind, args.batch, **build_kwargs),
-        specs=build_tensor_specs(args.kind, batch=args.batch, **paths, **spec_kwargs),
-        golden_fn=golden_decode_layer(args.kind),
-        compare_fn=compare_fns(args.kind),
-        config=run_config(args.backend_type, args.execution_mode, args.device,
-                          args.enable_chip_swimlane),
-        rtol=1e-2,
-        atol=1e-2,
-        compile_only=args.compile_only,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for batch in cases:
+        print(f"[case] decode_layer batch={batch}", flush=True)
+        result = run(
+            fn=build_kernel(args.kind, batch, **build_kwargs),
+            specs=build_tensor_specs(args.kind, batch=batch, **paths, **spec_kwargs),
+            golden_fn=golden_decode_layer(args.kind),
+            compare_fn=compare_fns(args.kind),
+            config=run_config(args.backend_type, args.execution_mode, args.device,
+                              args.enable_chip_swimlane),
+            rtol=1e-2,
+            atol=1e-2,
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED at batch={batch}")

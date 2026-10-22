@@ -42,6 +42,10 @@ HKV = QWEN3_8_27B.num_key_value_heads
 D = QWEN3_8_27B.head_dim
 KV_WIDTH = HKV * D                          # one token's K or V, flat
 
+# validation
+# one sequence, then a full padded batch; a task is one sequence.
+DEFAULT_CASES = (1, 16)
+
 # tiling
 PAGE = 128              # rows per page; must match `decode_attention`'s
 
@@ -191,22 +195,26 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--batch", type=int, default=None,
+                        help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--max-pages", type=int, default=8)
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
+    cases = [args.batch] if args.batch else list(DEFAULT_CASES)
 
-    result = run(
-        fn=build_kernel(max_pages=args.max_pages),
-        specs=build_tensor_specs(batch=args.batch, max_pages=args.max_pages),
-        golden_fn=golden_gdn_decode_kv_append(),
-        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
-                    device_id=args.device),
-        rtol=0.0,
-        atol=0.0,
-        compile_only=args.compile_only,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for batch in cases:
+        print(f"[case] decode_kv_append batch={batch}", flush=True)
+        result = run(
+            fn=build_kernel(max_pages=args.max_pages),
+            specs=build_tensor_specs(batch=batch, max_pages=args.max_pages),
+            golden_fn=golden_gdn_decode_kv_append(),
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
+                        device_id=args.device),
+            rtol=0.0,
+            atol=0.0,
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED at batch={batch}")

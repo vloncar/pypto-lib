@@ -51,7 +51,9 @@ BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 # above that floor. The ratio to the 0.54 GiB above is not the rule -- the MLP
 # runs on 512 MiB against 720 MiB of intermediates -- because the heap holds
 # what is in flight, and this program keeps more of it live at once.
-ATTN_RING_HEAP = 2 * 1024 * 1024 * 1024
+# Bytes per ring, one entry per scope depth, 0 leaving a ring at its default. The stage
+# scopes allocate on ring 1; a scalar here would reserve the same bytes on all four.
+ATTN_RING_HEAP = [0, 2 * 1024 * 1024 * 1024, 0, 0]
 
 # tiling; each projection shape gets its own patch
 M_TILE, N_TILE, K_TILE = 128, 128, 512
@@ -248,7 +250,6 @@ def compare_out():
                          f"(no inputs; absolute bound {ABS_VS_GOLDEN})")
             ok = dev_fq <= ABS_VS_GOLDEN and dev_row_fq <= ABS_VS_GOLDEN
         detail = "\n".join(lines)
-        print(detail, flush=True)
         return ok, "" if ok else detail
 
     return compare
@@ -280,6 +281,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
     cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
     if args.seq_len and args.seq_len % attn_core_pipe.KV_TILE:
@@ -305,6 +307,7 @@ if __name__ == "__main__":
             ),
             rtol=1e-2,
             atol=1e-5,
+            compile_only=args.compile_only,
         )
         if not result.passed:
             if result.error:

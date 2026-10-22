@@ -193,11 +193,10 @@ def compare_act_q():
         exact = float((step == 0).float().mean())
         line = (f"[stats] act_q: {exact * 100:.4f}% exact (gate {MIN_EXACT_VS_GOLDEN * 100:.0f}%), "
                 f"max {int(step.max())} step(s) off")
-        print(line)
         if exact < MIN_EXACT_VS_GOLDEN:
             why = f"only {exact * 100:.2f}% exact, below the {MIN_EXACT_VS_GOLDEN * 100:.0f}% gate"
             return False, f"{line}\n  {why}"
-        return ok, (detail + "\n" + line) if detail else line
+        return ok, (detail + "\n" + line) if not ok else ""
 
     return compare
 

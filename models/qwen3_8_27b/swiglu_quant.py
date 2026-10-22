@@ -132,11 +132,10 @@ def compare_act_q():
         exact_ok = exact >= MIN_EXACT_VS_GOLDEN
         line = (f"[stats] act_q: {exact * 100:.4f}% exact (gate {MIN_EXACT_VS_GOLDEN * 100:.0f}%), "
                 f"max {int(step.max())} step(s) off")
-        print(line)
         if not exact_ok:
             why = f"only {exact * 100:.2f}% exact, below the {MIN_EXACT_VS_GOLDEN * 100:.0f}% gate"
             return False, f"{line}\n  {why}"
-        return ok, (detail + "\n" + line) if detail else line
+        return ok, (detail + "\n" + line) if not ok else ""
 
     return compare
 
@@ -165,6 +164,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
     cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
     if len(cases) > 1 and (args.golden_data or args.runtime_dir):
@@ -189,6 +189,7 @@ if __name__ == "__main__":
             ),
             rtol=1e-2,
             atol=1e-5,
+            compile_only=args.compile_only,
         )
         if not result.passed:
             if result.error:

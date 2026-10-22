@@ -294,7 +294,6 @@ def compare_bf16(actual, expected, **_kwargs):
               f"or {ROW_FLOOR:.1e} of the row RMS; worst {float(steps.max()):.0f} steps at [{r}, {c}], "
               f"|golden| {float(e[r, c].abs()):.3e} against row RMS {float(row_rms[r]):.3e}, "
               f"diff {float(diff[r, c]):.3e} = {float(diff[r, c] / row_rms[r]):.1e} of the RMS")
-    print(detail, flush=True)
     ok = exact >= MIN_EXACT and not bool(over.any())
     return ok, "" if ok else detail
 
@@ -331,6 +330,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
     cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
     if len(cases) > 1 and (args.golden_data or args.runtime_dir):
@@ -355,6 +355,7 @@ if __name__ == "__main__":
             ),
             rtol=1e-2,
             atol=1e-2,
+            compile_only=args.compile_only,
         )
         if not result.passed:
             if result.error:

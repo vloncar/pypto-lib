@@ -49,6 +49,10 @@ SOFTPLUS_LINEAR = 20.0
 EARLY_RESOLVE = True
 
 
+# validation
+# one padded decode batch, then two.
+DEFAULT_CASES = (16, 32)
+
 # tiling
 TOK_TILE = M_FRACTAL    # tokens per task; the padded decode batch is a multiple of it
 
@@ -141,23 +145,27 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--batch", type=int, default=M_FRACTAL)
+    parser.add_argument("--batch", type=int, default=None,
+                        help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
-    if args.batch % TOK_TILE:
+    cases = [args.batch] if args.batch else list(DEFAULT_CASES)
+    if args.batch and args.batch % TOK_TILE:
         parser.error(f"--batch must be a multiple of TOK_TILE={TOK_TILE}")
 
-    result = run(
-        fn=gdn_decode_gate_test,
-        specs=build_tensor_specs(t=args.batch),
-        golden_fn=golden_gdn_decode_gate,
-        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
-                    device_id=args.device),
-        rtol=1e-2,
-        atol=1e-5,
-        compile_only=args.compile_only,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for batch in cases:
+        print(f"[case] decode_gate batch={batch}", flush=True)
+        result = run(
+            fn=gdn_decode_gate_test,
+            specs=build_tensor_specs(t=batch),
+            golden_fn=golden_gdn_decode_gate,
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
+                        device_id=args.device),
+            rtol=1e-2,
+            atol=1e-5,
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED at batch={batch}")

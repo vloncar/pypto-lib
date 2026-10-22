@@ -59,6 +59,10 @@ HQ = QWEN3_8_27B.num_attention_heads
 D = QWEN3_8_27B.head_dim
 ROT = QWEN3_8_27B.rotary_dim
 
+# validation
+# one padded decode batch, then two; the inlined tiles are checked against it.
+DEFAULT_CASES = (16, 32)
+
 # tiling
 QUANT_GROUPS = 4        # quant_x column groups (G5.23)
 ROPE_TOK_TILE = 16      # qk_rmsnorm_rope at a padded batch (decode_vector)
@@ -72,8 +76,6 @@ EARLY_RESOLVE = True
 # build argument so both schedules can be built in one process; the two are bit-identical.
 GATE_QUANT_FANNED = True
 PAGE = decode_kv_append.PAGE
-
-BLOCK_RING_HEAP = 256 * 1024 * 1024
 
 
 def _qg_copy_tile(m: int) -> int:
@@ -100,7 +102,7 @@ def run_config(backend_type: str = "a2a3", sim: bool = False, device: int = 0,
                swimlane: int = 0) -> dict:
     """The config `golden.run` needs for this mixer."""
     return dict(backend_type=backend_type, execution_mode=sim, device_id=device,
-                ring_heap=BLOCK_RING_HEAP, enable_chip_swimlane=swimlane)
+                enable_chip_swimlane=swimlane)
 
 
 def build_kernel(batch: int, max_pages: int, splits: int | None = None,
@@ -177,7 +179,7 @@ def build_kernel(batch: int, max_pages: int, splits: int | None = None,
     return decode_gated_attention
 
 
-__all__ = ["BLOCK_RING_HEAP", "attn_weights", "build_kernel", "run_config"]
+__all__ = ["attn_weights", "build_kernel", "run_config"]
 
 
 def build_tensor_specs(batch: int = 16, context: int = 320, max_pages: int = 8,
@@ -340,7 +342,6 @@ def compare_out():
                 f"{got_row:.3e} against {floor_row:.3e} ({ratio_row:.3f}x); {vs_fq:.3e} vs "
                 f"the fake-quant chain ({fq_ratio:.3f} of the floor, worst row "
                 f"{fq_ratio_row:.3f})")
-        print(line, flush=True)
         ok = (ratio <= MAX_OVER_FLOOR and ratio_row <= MAX_ROW_OVER_FLOOR
               and fq_ratio <= MAX_VS_GOLDEN and fq_ratio_row <= MAX_ROW_VS_GOLDEN)
         return ok, "" if ok else line
@@ -353,8 +354,6 @@ def compare_pages(name: str):
     def compare(actual, expected, **_kwargs):
         a, e = actual.double(), expected.double()
         rel = float((a - e).norm() / e.norm().clamp_min(1e-30))
-        print(f"[stats] {name}: rel frob {rel:.3e} over the whole pool, oracle norm "
-              f"{float(e.norm()):.3e}", flush=True)
         ok = rel <= 2e-2
         return ok, "" if ok else f"{name} rel {rel:.3e} exceeds 2e-2"
 
@@ -370,7 +369,8 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--batch", type=int, default=None,
+                        help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--context", type=int, default=320)
     parser.add_argument("--max-pages", type=int, default=0,
                         help="0 derives it from --context")
@@ -381,24 +381,27 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0,
                         choices=range(5))
     args = parser.parse_args()
+    cases = [args.batch] if args.batch else list(DEFAULT_CASES)
 
     max_pages = args.max_pages or (args.context + PAGE - 1) // PAGE
 
-    result = run(
-        fn=build_kernel(args.batch, max_pages=max_pages, splits=args.splits),
-        specs=build_tensor_specs(batch=args.batch, context=args.context,
-                                 max_pages=max_pages, weights=args.weights),
-        golden_fn=golden_decode_gated_attention,
-        compare_fn={"out": compare_out(),
-                    "k_pages": compare_pages("k_pages"),
-                    "v_pages": compare_pages("v_pages")},
-        config=run_config(args.backend_type, args.execution_mode, args.device,
-                          args.enable_chip_swimlane),
-        rtol=1e-2,
-        atol=1e-2,
-        compile_only=args.compile_only,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for batch in cases:
+        print(f"[case] decode_gated_attention batch={batch}", flush=True)
+        result = run(
+            fn=build_kernel(batch, max_pages=max_pages, splits=args.splits),
+            specs=build_tensor_specs(batch=batch, context=args.context,
+                                     max_pages=max_pages, weights=args.weights),
+            golden_fn=golden_decode_gated_attention,
+            compare_fn={"out": compare_out(),
+                        "k_pages": compare_pages("k_pages"),
+                        "v_pages": compare_pages("v_pages")},
+            config=run_config(args.backend_type, args.execution_mode, args.device,
+                              args.enable_chip_swimlane),
+            rtol=1e-2,
+            atol=1e-2,
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED at batch={batch}")

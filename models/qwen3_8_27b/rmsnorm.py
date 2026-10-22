@@ -370,9 +370,8 @@ def compare_residual_out():
         same = int((actual == expected).sum())
         total = actual.numel()
         line = f"[stats] residual_out: {same}/{total} elements bit-identical"
-        print(line, flush=True)
         if same == total:
-            return True, line
+            return True, ""
         worst = float((actual.double() - expected.double()).abs().max())
         return False, f"{line}; worst absolute difference {worst:.3e}"
 
@@ -395,7 +394,6 @@ def compare_y():
         worst = int(step.max())
         line = (f"[stats] y: {exact * 100:.4f}% bit-identical (gate "
                 f"{MIN_EXACT_VS_GOLDEN * 100:.0f}%), max {worst} BF16 step(s) off")
-        print(line, flush=True)
         ok = exact >= MIN_EXACT_VS_GOLDEN and worst <= 1
         return ok, line if not ok else ""
 

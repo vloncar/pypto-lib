@@ -139,7 +139,6 @@ def compare_y(actual, expected, **_kwargs):
     row = float(((dev - ref).norm(dim=-1) / ref.norm(dim=-1)).max())
     detail = (f"[stats] y vs float64 golden: rel frob {rel:.3e} (gate {MAX_REL}), "
               f"worst row {row:.3e} (gate {MAX_ROW_REL})")
-    print(detail, flush=True)
     ok = rel <= MAX_REL and row <= MAX_ROW_REL
     return ok, "" if ok else detail
 
@@ -198,6 +197,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
     cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
     if args.seq_len and args.seq_len % (args.m_group * M_TILE):
@@ -224,6 +224,7 @@ if __name__ == "__main__":
                         device_id=args.device),
             rtol=1e-2,
             atol=1e-2,
+            compile_only=args.compile_only,
         )
         if not result.passed:
             if result.error:

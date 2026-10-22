@@ -62,6 +62,10 @@ D = QWEN3_8_27B.linear_value_head_dim
 KCONV = QWEN3_8_27B.linear_conv_kernel_dim  # convolution taps
 STATE_LEN = KCONV - 1
 
+# validation
+# one padded decode batch, then two; the inlined tiles are checked against it.
+DEFAULT_CASES = (16, 32)
+
 # tiling, each the decode value its own module measured or `decode_vector` carries
 QUANT_GROUPS = 4        # quant_x column groups (G5.23)
 AB_M_TILE = 16          # in_proj_ab at a padded batch (decode_vector)
@@ -75,18 +79,12 @@ HEAD_TILE = 8           # decode_delta_rule head-states per task (G5.4)
 # build argument so both schedules can be built in one process; the two are bit-identical.
 GATED_NORM_FANNED = True
 
-# A decode step holds far less than prefill's 1.3 GB -- the largest intermediate is one
-# token tile of `qkv`, 327 KB at batch 16 -- but the recurrent state pool is resident and
-# the delta rule's own crossing is what sizes the ring. Start at the per-layer default and
-# raise it only if the runtime says HEAD_RING_DEADLOCK; 256 MiB is the runtime's own default.
-BLOCK_RING_HEAP = 256 * 1024 * 1024
-
 
 def run_config(backend_type: str = "a2a3", sim: bool = False, device: int = 0,
                swimlane: int = 0) -> dict:
     """The config `golden.run` needs for this block."""
     return dict(backend_type=backend_type, execution_mode=sim, device_id=device,
-                ring_heap=BLOCK_RING_HEAP, enable_chip_swimlane=swimlane)
+                enable_chip_swimlane=swimlane)
 
 
 def build_kernel(batch: int, head_tile: int = HEAD_TILE, inline: bool = False):
@@ -280,7 +278,7 @@ def golden_decode_gdn_block(weights: str | None = None):
     return golden
 
 
-__all__ = ["BLOCK_RING_HEAP", "build_kernel", "build_tensor_specs",
+__all__ = ["build_kernel", "build_tensor_specs",
            "golden_decode_gdn_block", "run_config"]
 
 
@@ -373,7 +371,6 @@ def compare_out(batch: int, weights: str | None):
                 f"{got_row:.3e} against {floor_row:.3e} ({ratio_row:.3f}x); {vs_fq:.3e} vs "
                 f"the fake-quant chain ({fq_ratio:.3f} of the floor, worst row "
                 f"{fq_ratio_row:.3f})")
-        print(line, flush=True)
         ok = (ratio <= MAX_OVER_FLOOR and ratio_row <= MAX_ROW_OVER_FLOOR
               and fq_ratio <= MAX_VS_GOLDEN and fq_ratio_row <= MAX_ROW_VS_GOLDEN)
         return ok, "" if ok else line
@@ -388,8 +385,6 @@ def compare_pool(name: str):
         num = (a - e).norm()
         den = e.norm().clamp_min(1e-30)
         rel = float(num / den)
-        print(f"[stats] {name}: rel frob {rel:.3e} over the whole pool, oracle norm "
-              f"{float(e.norm()):.3e}", flush=True)
         ok = rel <= 2e-2
         return ok, "" if ok else f"{name} rel {rel:.3e} exceeds 2e-2"
 
@@ -405,7 +400,8 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--batch", type=int, default=None,
+                        help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--head-tile", type=int, default=HEAD_TILE)
     parser.add_argument("--weights", type=str, default=None,
                         help="one layer's BF16 linear_attn tensors; default: random weights")
@@ -413,21 +409,24 @@ if __name__ == "__main__":
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0,
                         choices=range(5))
     args = parser.parse_args()
+    cases = [args.batch] if args.batch else list(DEFAULT_CASES)
 
-    result = run(
-        fn=build_kernel(args.batch, head_tile=args.head_tile),
-        specs=build_tensor_specs(batch=args.batch, weights=args.weights),
-        golden_fn=golden_decode_gdn_block(args.weights),
-        compare_fn={"out": compare_out(args.batch, args.weights),
-                    "conv_state": compare_pool("conv_state"),
-                    "state": compare_pool("state")},
-        config=run_config(args.backend_type, args.execution_mode, args.device,
-                          args.enable_chip_swimlane),
-        rtol=1e-2,
-        atol=1e-2,
-        compile_only=args.compile_only,
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for batch in cases:
+        print(f"[case] decode_gdn_block batch={batch}", flush=True)
+        result = run(
+            fn=build_kernel(batch, head_tile=args.head_tile),
+            specs=build_tensor_specs(batch=batch, weights=args.weights),
+            golden_fn=golden_decode_gdn_block(args.weights),
+            compare_fn={"out": compare_out(batch, args.weights),
+                        "conv_state": compare_pool("conv_state"),
+                        "state": compare_pool("state")},
+            config=run_config(args.backend_type, args.execution_mode, args.device,
+                              args.enable_chip_swimlane),
+            rtol=1e-2,
+            atol=1e-2,
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED at batch={batch}")

@@ -128,6 +128,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
     cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
     if len(cases) > 1 and (args.golden_data or args.runtime_dir):
@@ -149,6 +150,7 @@ if __name__ == "__main__":
             ),
             rtol=0,
             atol=0,
+            compile_only=args.compile_only,
         )
         if not result.passed:
             if result.error:

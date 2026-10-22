@@ -43,7 +43,9 @@ BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 # The heap holds what is in flight, not the whole intermediate set, so it does
 # not scale with that 720 MiB: measured at T = 8192, 512 MiB runs and 256 MiB
 # does not. One power of two above the floor, the runtime taking powers of two.
-MLP_RING_HEAP = 1024 * 1024 * 1024
+# Bytes per ring, one entry per scope depth, 0 leaving a ring at its default. The stage
+# scopes allocate on ring 1; a scalar here would reserve the same bytes on all four.
+MLP_RING_HEAP = [0, 1024 * 1024 * 1024, 0, 0]
 
 # acceptance: the gate is the distance to the W8A8 golden, as a fraction of
 # what quantization itself costs. At T = 8192 the kernel measures 0.161 of the
@@ -302,7 +304,6 @@ def compare_out():
                          f"(no inputs; absolute bound {ABS_VS_GOLDEN})")
             ok = dev_fq <= ABS_VS_GOLDEN and dev_row_fq <= ABS_VS_GOLDEN
         detail = "\n".join(lines)
-        print(detail)
         return ok, "" if ok else detail
 
     return compare
@@ -349,6 +350,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
     cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
     if args.seq_len and args.seq_len % UP_M_TILE:
@@ -374,6 +376,7 @@ if __name__ == "__main__":
             ),
             rtol=1e-2,
             atol=1e-5,
+            compile_only=args.compile_only,
         )
         if not result.passed:
             if result.error:

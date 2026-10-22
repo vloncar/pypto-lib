@@ -194,7 +194,9 @@ def _gdn_chunk_o_pipe(
 # failed with code -2` and names nothing about the heap. **Measured floor 512 MiB at
 # T = 65536**; set one power of two above it, as `mlp` and `gated_attention` are. The
 # heapless entry ran at T = 8192 and 32768, which is why this was missed.
-PIPE_RING_HEAP = 1024 * 1024 * 1024
+# Bytes per ring, one entry per scope depth, 0 leaving a ring at its default. The stage
+# scopes allocate on ring 1; a scalar here would reserve the same bytes on all four.
+PIPE_RING_HEAP = [0, 1024 * 1024 * 1024, 0, 0]
 
 
 gdn_chunk_o_pipe = pl.jit.inline(auto_scope=False)(_gdn_chunk_o_pipe)
@@ -229,6 +231,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
     cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
     if len(cases) > 1 and (args.golden_data or args.runtime_dir):
@@ -253,6 +256,7 @@ if __name__ == "__main__":
                         device_id=args.device, ring_heap=PIPE_RING_HEAP),
             rtol=1e-2,
             atol=1e-2,
+            compile_only=args.compile_only,
         )
         if not result.passed:
             if result.error:

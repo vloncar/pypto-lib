@@ -87,6 +87,10 @@ GROUP = HQ // HKV                               # query heads sharing one KV hea
 Q_WIDTH = HQ * D
 KV_WIDTH = HKV * D
 
+# validation
+# one sequence, then the serving batch; a task is one sequence and KV head.
+DEFAULT_CASES = (1, 4)
+
 # tiling
 PAGE = 128              # KV page size; the serving layer's choice, not the kernel's
 SPLITS = 1              # page ranges per sequence; see the table above
@@ -383,8 +387,8 @@ def _rel_ok(threshold: float, label: str):
         rel = float(num / den) if float(den) > 0 else float(num)
         peak = float((actual.double() - expected.double()).abs().max())
         detail = f"{label} rel {rel:.3e} (<= {threshold:.0e}), peak abs {peak:.3e}"
-        print(f"[stats] {detail}", flush=True)
-        return rel <= threshold, detail
+        ok = rel <= threshold
+        return ok, "" if ok else detail
 
     return compare
 
@@ -399,7 +403,8 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--batch", type=int, default=4)
+    parser.add_argument("--batch", type=int, default=None,
+                        help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--context", type=int, default=320)
     parser.add_argument("--max-pages", type=int, default=None,
                         help="pages per sequence; derived from --context when omitted, "
@@ -408,6 +413,7 @@ if __name__ == "__main__":
     parser.add_argument("--splits", type=int, default=SPLITS)
     parser.add_argument("--rounds", type=int, default=0)
     args = parser.parse_args()
+    cases = [args.batch] if args.batch else list(DEFAULT_CASES)
     max_pages = args.max_pages or (args.context + PAGE - 1) // PAGE
     if max_pages * PAGE < args.context:
         parser.error(f"--max-pages {max_pages} holds {max_pages * PAGE} tokens, "
@@ -420,26 +426,28 @@ if __name__ == "__main__":
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
-    result = run(
-        fn=build_kernel(max_pages, splits=args.splits),
-        specs=build_tensor_specs(args.batch, args.context, max_pages),
-        golden_fn=None if args.rounds else golden_fn,
-        compile_only=args.compile_only,
-        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
-                    device_id=args.device),
-        rtol=2e-2, atol=2e-2,
-        compare_fn=None if args.rounds else {"o": _rel_ok(6e-3, "o")},
-    )
-    if args.rounds and result.bench is not None:
-        import statistics
-        s = [x for x in result.bench.per_round("effective") if x > 0]
-        if s:
-            kv = 2 * args.context * KV_WIDTH * 2 * args.batch
-            med = statistics.median(s)
-            print(f"[bench] batch={args.batch} context={args.context} "
-                  f"median={med:.1f} us  KV {kv / 1e6:.2f} MB -> {kv / med / 1e3:.1f} GB/s",
-                  flush=True)
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for batch in cases:
+        print(f"[case] decode_attention batch={batch}", flush=True)
+        result = run(
+            fn=build_kernel(max_pages, splits=args.splits),
+            specs=build_tensor_specs(batch, args.context, max_pages),
+            golden_fn=None if args.rounds else golden_fn,
+            compile_only=args.compile_only,
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode,
+                        device_id=args.device),
+            rtol=2e-2, atol=2e-2,
+            compare_fn=None if args.rounds else {"o": _rel_ok(6e-3, "o")},
+        )
+        if args.rounds and result.bench is not None:
+            import statistics
+            s = [x for x in result.bench.per_round("effective") if x > 0]
+            if s:
+                kv = 2 * args.context * KV_WIDTH * 2 * batch
+                med = statistics.median(s)
+                print(f"[bench] batch={batch} context={args.context} "
+                      f"median={med:.1f} us  KV {kv / 1e6:.2f} MB -> {kv / med / 1e3:.1f} GB/s",
+                      flush=True)
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(f"FAILED at batch={batch}")
