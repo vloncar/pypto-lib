@@ -44,11 +44,14 @@ N_TILE = 128            # output channels per output tile
 K_TILE = 256            # contraction step; 256 BF16 columns is one L2 line
 M_GROUP = 8             # output tiles a block walks down the token axis
 N_GROUP = 2             # and across the channel axis
+K_STAGGER = 1           # rotate each block's K start; see `a8w8_linear`
+RING_SLOTS = 2          # GM transport depth; the on-chip reserve stays at 1
 
 
 def build_kernel(m: int, k: int, n: int, name: str = "bf16_linear",
                  inline: bool = False, m_tile: int = M_TILE, n_tile: int = N_TILE,
-                 k_tile: int = K_TILE, m_group: int = M_GROUP, n_group: int = N_GROUP):
+                 k_tile: int = K_TILE, m_group: int = M_GROUP, n_group: int = N_GROUP,
+                 k_stagger: int = K_STAGGER, ring_slots: int = RING_SLOTS):
     """The projection at one shape.
 
     A block walks an `m_group` by `n_group` patch of output tiles rather than
@@ -73,11 +76,13 @@ def build_kernel(m: int, k: int, n: int, name: str = "bf16_linear",
         w: pl.Tensor[[n, k], pl.BF16],
         y: pl.Out[pl.Tensor[[m, n], pl.BF16]],
     ):
-        # slot_num=1: the ring is sized by the tile crossing cube to vector, here
-        # the FP32 accumulator, and two slots of it exceed the vector buffer
-        # (pypto#2903).
+        # The tile crossing cube to vector is the FP32 accumulator, and two slots of
+        # it do not fit the vector buffer (pypto#2903). `local_slot_num` holds that
+        # reserve at one slot while `ring_slots` buys depth in GM, so the cube need
+        # not wait for the vector to free a slot before pushing the next tile.
         for blk in pl.spmd(mg * ng, name_hint=name,
-                           optimizations=[pl.cross_core_slot(slot_num=1)]):
+                           optimizations=[pl.cross_core_slot(slot_num=ring_slots,
+                                                             local_slot_num=1)]):
             pm = (blk % mg) * m_group
             pn = (blk // mg) * n_group
             for gm in pl.range(m_group):
@@ -90,7 +95,11 @@ def build_kernel(m: int, k: int, n: int, name: str = "bf16_linear",
                     acc0 = pl.create_tensor([m_tile, n_tile], dtype=pl.FP32)
                     acc1 = pl.create_tensor([m_tile, n_tile], dtype=pl.FP32)
                     for kb in pl.pipeline(0, k // k_tile, stage=2):
-                        k0 = kb * k_tile
+                        # `k_stagger` rotates where this block starts its K sweep, so the
+                        # resident blocks are not all asking for the same slice of the
+                        # weight at once. `init_cond` still means this block's first step,
+                        # and the sum over K is commutative.
+                        k0 = ((kb + blk * k_stagger) % (k // k_tile)) * k_tile
                         at = a[m0 : m0 + m_tile, k0 : k0 + k_tile]
                         acc0 = pl.matmul_acc(acc0, at, w[n0 : n0 + n_tile, k0 : k0 + k_tile],
                                              b_trans=True, init_cond=(kb == 0))
@@ -190,7 +199,10 @@ if __name__ == "__main__":
                         help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--weights", type=str, default=None,
                         help="a real GDN layer from weights.py; default: random weights")
+    parser.add_argument("--n-tile", type=int, default=N_TILE)
     parser.add_argument("--k-tile", type=int, default=K_TILE)
+    parser.add_argument("--k-stagger", type=int, default=K_STAGGER)
+    parser.add_argument("--ring-slots", type=int, default=RING_SLOTS)
     parser.add_argument("--m-group", type=int, default=M_GROUP)
     parser.add_argument("--n-group", type=int, default=N_GROUP)
     parser.add_argument("--rounds", type=int, default=0)
@@ -212,8 +224,9 @@ if __name__ == "__main__":
     for t in cases:
         print(f"[case] bf16_linear T={t}", flush=True)
         result = run(
-            fn=build_kernel(t, K, N, k_tile=args.k_tile,
-                            m_group=args.m_group, n_group=args.n_group),
+            fn=build_kernel(t, K, N, n_tile=args.n_tile, k_tile=args.k_tile,
+                            m_group=args.m_group, n_group=args.n_group,
+                            k_stagger=args.k_stagger, ring_slots=args.ring_slots),
             specs=build_specs(t=t, weights=args.weights),
             golden_fn=golden_fn,
             compare_fn={"y": compare_y},

@@ -243,9 +243,11 @@ def build_kernel(module: str, batch: int, inline: bool = False):
     k, n, n_tile, k_tile, n_group = DECODE_TILES[module]
     m = padded_batch(batch)
     if module in BF16_MODULES:
+        # `k_stagger` and `ring_slots` stay off: DECODE_TILES was swept without them,
+        # and at a decode batch this projection is bound by the weight it streams.
         return bf16_linear.build_kernel(m, k, n, name=module, inline=inline, m_tile=m,
                                         n_tile=n_tile, k_tile=k_tile, m_group=1,
-                                        n_group=n_group)
+                                        n_group=n_group, k_stagger=0, ring_slots=1)
     return a8w8_linear.build_kernel(m, k, n, name=module, inline=inline, m_tile=m,
                                     n_tile=n_tile, k_tile=k_tile, m_group=1,
                                     n_group=n_group)

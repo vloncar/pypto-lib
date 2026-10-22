@@ -252,12 +252,22 @@ implements -- bf16 output rounding and nothing else -- and the quantisation is
 the whole of the rest.
 
 The block's `out_proj` left that table when it became BF16. One card, one
-grant, T = 8192, 50 rounds: **939 us** as A8W8 against **1996 us** through
-`bf16_linear`, 2.13x. That is the dtype and not the schedule -- 548 INT8 TOPS
-against 258 bf16 TFLOPS is the same 69 to 73% of each peak. On the composed
-block the same pair measures 9094.7 against 9731.9 us at T = 8192 and 5017.0
-against 5388.6 at T = 4096, so the BF16 projection costs **7.0 to 7.4% of the
-block** and buys the 1.9x smaller quantisation error above.
+grant, T = 8192, 50 rounds: **939 us** as A8W8 against **1858 us** through
+`bf16_linear`, 1.98x. The remaining gap is the dtype and not the schedule: the
+patch shape and the K tile were swept at this shape, ten points, and nothing
+beat the current 8 x 2 -- the shapes that cut requested GM traffic 2.5 to 3.3x
+measured 11 to 41% **slower**, so the extra bytes are not what costs it. What
+did help was latency, the two knobs its INT8 sibling already had: a GM
+transport ring two slots deep with the on-chip reserve at one, and the K
+stagger. Together they take the projection from 1995.6 to **1857.9 us**
+(-6.9%; depth 2 alone -3.4%, the stagger alone -2.1%, depth 4 no further) and
+the composed block from 9720.9 to **9637.0**. A smaller crossing at `n_tile`
+64 with two slots is 34% worse, so the depth is worth more than the tile it
+would cost.
+
+On the composed block, A8W8 against the tuned BF16 in one grant: **9094.7
+against 9637.0 us at T = 8192**, so the projection costs **6.0% of the block**
+and buys the 1.9x smaller quantisation error above.
 
 ## Validating and benchmarking
 
