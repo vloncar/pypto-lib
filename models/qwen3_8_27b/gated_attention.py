@@ -20,11 +20,10 @@ import pypto.language as pl
 
 import a8w8_linear
 import attn_core
-from attn_core_pipe import qwen3_attn_core_pipe
+from attn_core import qwen3_attn_core
 from attn_gate_quant import qwen3_attn_gate_quant
 from qk_rmsnorm_rope import qwen3_qk_rmsnorm_rope
 from quant_x import gdn_quant_x
-import attn_core_pipe
 from config import QWEN3_8_27B
 
 # model config
@@ -90,7 +89,7 @@ def build_kernel(t: int = BENCH_SEQ, inline: bool = False):
     op_v = a8w8_linear.build_kernel(m=t, k=HIDDEN, n=KV_WIDTH, name="v_proj", inline=True,
                                     m_tile=M_TILE, n_tile=N_TILE, k_tile=K_TILE,
                                     m_group=kv_m_group, n_group=2, ring_slots=RING_SLOTS)
-    core_kv_tile, core_row_tile = attn_core_pipe.KV_TILE, attn_core_pipe.ROW_TILE
+    core_kv_tile, core_row_tile = attn_core.KV_TILE, attn_core.ROW_TILE
     # o_proj is the same 6144 -> 5120 shape `out_proj.py` runs, and takes the
     # same 8 x 2 patch: `_patch` would give 8 x 8, which leaves 40 blocks for
     # 24 cores and measures 1186.8 us against 1056.5
@@ -134,7 +133,7 @@ def build_kernel(t: int = BENCH_SEQ, inline: bool = False):
         qwen3_qk_rmsnorm_rope(qg, k, q_norm_w, k_norm_w, rope_cos, rope_sin, q_rot, k_rot)
 
         attended = pl.create_tensor([t, O_WIDTH], dtype=pl.BF16)
-        qwen3_attn_core_pipe(q_rot, k_rot, v, mask_bias, attended)
+        qwen3_attn_core(q_rot, k_rot, v, mask_bias, attended)
 
         act_q = pl.create_tensor([t, O_WIDTH], dtype=pl.INT8)
         act_scale = pl.create_tensor([1, t], dtype=pl.FP32)
@@ -167,7 +166,7 @@ def _tables(t: int):
 
     import reference
 
-    row_tile, kv_tile = attn_core_pipe.ROW_TILE, attn_core_pipe.KV_TILE
+    row_tile, kv_tile = attn_core.ROW_TILE, attn_core.KV_TILE
     cos, sin = reference.rotary_cos_sin(torch.arange(t), QWEN3_8_27B)
     return cos.float(), sin.float(), attn_core.causal_bias(row_tile, kv_tile)
 
@@ -186,7 +185,7 @@ def build_tensor_specs(t: int = BENCH_SEQ, weights: str | None = None):
     def table(i):
         return lambda: _tables(t)[i]
 
-    row_tile, kv_tile = attn_core_pipe.ROW_TILE, attn_core_pipe.KV_TILE
+    row_tile, kv_tile = attn_core.ROW_TILE, attn_core.KV_TILE
     bias_width = 2 * kv_tile - row_tile
     return [
         TensorSpec("x", [t, HIDDEN], torch.bfloat16, init_value=draw("x")),
@@ -284,8 +283,8 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
     cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
-    if args.seq_len and args.seq_len % attn_core_pipe.KV_TILE:
-        parser.error(f"--seq-len must be a multiple of {attn_core_pipe.KV_TILE}")
+    if args.seq_len and args.seq_len % attn_core.KV_TILE:
+        parser.error(f"--seq-len must be a multiple of {attn_core.KV_TILE}")
     if len(cases) > 1 and (args.golden_data or args.runtime_dir):
         parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
 
