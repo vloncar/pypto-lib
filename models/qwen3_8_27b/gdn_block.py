@@ -232,6 +232,32 @@ def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, hg: int = HG, d: int = D,
     ]
 
 
+def block_weights(tensors):
+    """The checkpoint-native weight dict `reference.block` reads, from the kernel's own.
+
+    The int8 projections stay int8 with their scales beside them, which is the form
+    `reference.weight` dequantises; `out_proj` is bf16 and carries no scale; `w_ab`'s
+    halves split back into the two projections the spec concatenated; and `conv_w` turns
+    back from the kernel's `[K, C]` to the checkpoint's `[C, 1, K]`.
+
+    A composed caller needs this: its oracle has to read the same weights the device was
+    given, not a second draw from the same source.
+    """
+    return {
+        "in_proj_qkv.weight": tensors["w_qkv"],
+        "in_proj_qkv.weight_scale": tensors["w_qkv_scale"],
+        "in_proj_z.weight": tensors["w_z"],
+        "in_proj_z.weight_scale": tensors["w_z_scale"],
+        "out_proj.weight": tensors["w_out"],
+        "in_proj_a.weight": tensors["w_ab"][:H],
+        "in_proj_b.weight": tensors["w_ab"][H:],
+        "conv1d.weight": tensors["conv_w"].t().contiguous().reshape(CQKV, 1, KCONV),
+        "A_log": tensors["a_log"],
+        "dt_bias": tensors["dt_bias"],
+        "norm.weight": tensors["norm_w"],
+    }
+
+
 def golden_gdn_block(weights: str | None = None):
     """The fake-quant chain: the block in float64 with the two activation quantisations.
 

@@ -56,6 +56,7 @@ the block runs them.
 | [bf16_linear.py](../../../models/qwen3_8_27b/bf16_linear.py) | the normed output back to the residual stream, BF16 both sides |
 | [gdn_layer.py](../../../models/qwen3_8_27b/gdn_layer.py) | the delta rule's six stages as one program |
 | [gdn_block.py](../../../models/qwen3_8_27b/gdn_block.py) | all fourteen as one program, hidden states in and out |
+| [prefill_layer.py](../../../models/qwen3_8_27b/prefill_layer.py) | a whole decoder layer over a prefill chunk, either mixer, with both residual adds and the MLP |
 
 The two A8W8 projections are the same arithmetic at two shapes and share
 one implementation, [a8w8_linear.py](../../../models/qwen3_8_27b/a8w8_linear.py);

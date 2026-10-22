@@ -501,12 +501,12 @@ def golden_decode_layer(kind: str):
                 tensors["norm_post_w"])
 
         mixer, _ = mixer_oracle(kind, tensors, quant=False)
-        truth = reference.decode_layer(*head, mixer, mlp_w, QWEN3_8_27B, quant=False)
+        truth = reference.residual_layer(*head, mixer, mlp_w, QWEN3_8_27B, quant=False)
         _TRUTH["residual_out"] = truth["residual_out"]
         _TRUTH["mlp_out"] = truth["mlp_out"]
 
         mixer, pools = mixer_oracle(kind, tensors, quant=True)
-        chain = reference.decode_layer(*head, mixer, mlp_w, QWEN3_8_27B, quant=True)
+        chain = reference.residual_layer(*head, mixer, mlp_w, QWEN3_8_27B, quant=True)
         tensors["residual_out"].copy_(chain["residual_out"].to(torch.float32))
         tensors["mlp_out"].copy_(chain["mlp_out"].to(torch.bfloat16))
         if pools is not None:

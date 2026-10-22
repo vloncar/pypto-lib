@@ -1191,23 +1191,25 @@ def decoder_layer(x: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config
     }
 
 
-def decode_layer(residual: torch.Tensor, delta: torch.Tensor, norm_in_w: torch.Tensor,
-                 norm_post_w: torch.Tensor, mixer: Callable[[torch.Tensor], torch.Tensor],
-                 mlp_w: dict[str, torch.Tensor], cfg: Qwen38Config, quant: bool = True
-                 ) -> dict[str, torch.Tensor]:
-    """One decoder layer at decode: two residual adds, two norms, a mixer and the MLP.
+def residual_layer(residual: torch.Tensor, delta: torch.Tensor, norm_in_w: torch.Tensor,
+                   norm_post_w: torch.Tensor, mixer: Callable[[torch.Tensor], torch.Tensor],
+                   mlp_w: dict[str, torch.Tensor], cfg: Qwen38Config, quant: bool = True
+                   ) -> dict[str, torch.Tensor]:
+    """One decoder layer: two residual adds, two norms, a mixer and the MLP.
 
     `mixer` is a callable taking the normed hidden states and returning that mixer's
-    output, so this function carries the layer's own arithmetic and nothing else. Either
-    decode mixer oracle fits -- :func:`recurrent_block` for a linear-attention layer,
-    :func:`attn_w8a8_decode` for a full-attention one -- closed over its own weights and
-    its own state, which only the caller can supply.
+    output, so this function carries the layer's own arithmetic and nothing else, and
+    serves both paths. Any of the four mixer oracles fits -- :func:`block` or
+    :func:`attn_w8a8` over a prefill chunk, :func:`recurrent_block` or
+    :func:`attn_w8a8_decode` at a decode batch -- closed over its own weights and its own
+    state, which only the caller can supply.
 
     **The layer boundary is one add behind the module boundary.** `delta` is the previous
     layer's MLP output and `residual` the stream it adds to, so the layer begins by
     completing that addition and ends with its own MLP output still unadded. That is what
-    a stacked decode loop computes per layer: two fused add-and-norm stages, not two norms
-    and two separate adds. `out` is the complete layer output for a caller that wants it.
+    a stacked loop computes per layer, on either path: two fused add-and-norm stages, not
+    two norms and two separate adds. `out` is the complete layer output for a caller that
+    wants it.
 
     *quant* picks the chain. With it, the dtypes are modelled where the kernels hold them:
     the running residual in fp32, every norm output and the mixer output in bf16, and the
