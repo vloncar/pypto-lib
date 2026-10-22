@@ -17,7 +17,8 @@ The two bf16 narrowings are the model's own cast sequence (`Qwen3_5RMSNormGated`
 """
 import pypto.language as pl
 
-from config import GDN_QUANT, GDN_TILING, PREFILL_SEQ, QWEN3_8_27B
+from chunk_cumsum import CHUNK_TILE
+from config import GDN_QUANT, QWEN3_8_27B
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -27,12 +28,16 @@ H = QWEN3_8_27B.linear_num_value_heads      # value heads
 D = QWEN3_8_27B.linear_value_head_dim       # head dimension, the norm's axis
 EPS = QWEN3_8_27B.rms_norm_eps
 VAL_WIDTH = H * D                           # one token's contiguous run
-CHUNK_TILE = GDN_TILING.chunk               # only picks the reference chain to draw from
 
 # quantization
 SCALE_MAX = GDN_QUANT.scale_max
 AMAX_EPS = GDN_QUANT.amax_eps
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+# validation
+# One chunk of the fixture's chain, then eight. The token count must be a multiple
+# of CHUNK_TILE, and the bf16 and fanned bodies are separate programs, so the
+# default set runs each of them once rather than leaving two uncovered.
+DEFAULT_CASES = (128, 1024)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # gate
 MIN_EXACT_VS_REFERENCE = 0.95   # of y_q elements identical to the fake-quant reference
@@ -366,7 +371,7 @@ def _norm_weight(weights: str | None):
     return torch.load(weights, weights_only=True)["norm.weight"]
 
 
-def build_tensor_specs(t: int = T, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
+def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, d: int = D, chunk: int = CHUNK_TILE,
                        weights: str | None = None, quant: bool = True):
     import torch
     from golden import TensorSpec
@@ -403,8 +408,8 @@ def compare_y_q(t: int, chunk: int, weights: str | None):
     change moves a large fraction of the output by exactly one step, which a
     step bound alone accepts.
 
-    Printed beside the verdict: the dequantized output's distance from the
-    float64 `y` and from the fake-quant reference's dequantized `y`.
+    Reported when it fails: the dequantized output's distance from the float64 `y`
+    and from the fake-quant reference's dequantized `y`.
     """
     import torch
 
@@ -418,7 +423,7 @@ def compare_y_q(t: int, chunk: int, weights: str | None):
     def compare(actual, expected, actual_outputs=None, **kw):
         ok, detail = golden_gate(actual, expected, actual_outputs=actual_outputs, **kw)
         step = (actual.to(torch.int32) - expected.to(torch.int32)).abs()
-        lines = [f"[stats] y_q vs golden: {float((step == 0).float().mean()) * 100:.4f}% exact, "
+        lines = [f"y_q vs golden: {float((step == 0).float().mean()) * 100:.4f}% exact, "
                  f"max {int(step.max())} step(s) off"]
         if actual_outputs is not None and "y_scale" in actual_outputs:
             scale_dev = actual_outputs["y_scale"].cpu().float().reshape(-1)
@@ -431,7 +436,7 @@ def compare_y_q(t: int, chunk: int, weights: str | None):
             scale_ok = scale_rel <= 2e-2
             exact_ok = exact_ref >= MIN_EXACT_VS_REFERENCE
             ref_ok = ref_ok and exact_ok
-            lines.append(f"[stats] y_q vs fake-quant reference: "
+            lines.append(f"y_q vs fake-quant reference: "
                          f"{exact_ref * 100:.4f}% exact (gate {MIN_EXACT_VS_REFERENCE * 100:.0f}%), "
                          f"max {int(step.max())} step(s) off, "
                          f"y_scale max rel diff {scale_rel:.2e} "
@@ -439,7 +444,7 @@ def compare_y_q(t: int, chunk: int, weights: str | None):
             y_dev = reference.dequantize(actual, scale_dev)
             y_ref = _draw("y", t, chunk, weights)().reshape(t, -1)
             y_fq = reference.dequantize(q_ref, scale_ref)
-            lines.append(f"[stats] dequantised y: rel frob {float((y_dev - y_ref).norm() / y_ref.norm()):.3e} "
+            lines.append(f"dequantised y: rel frob {float((y_dev - y_ref).norm() / y_ref.norm()):.3e} "
                          f"vs float64 y, {float((y_dev - y_fq).norm() / y_fq.norm()):.3e} "
                          f"vs fake-quant reference")
             if not (ref_ok and scale_ok):
@@ -449,8 +454,9 @@ def compare_y_q(t: int, chunk: int, weights: str | None):
                 if not scale_ok:
                     why.append(f"y_scale off by {scale_rel:.2e}")
                 ok, detail = False, "; ".join([detail, f"vs fake-quant reference: {ref_detail}", *why])
-        print("\n".join(lines), flush=True)
-        return ok, detail
+        if ok:
+            return True, ""
+        return False, "\n".join([*(f"    {line}" for line in lines), detail])
 
     return compare
 
@@ -463,11 +469,13 @@ def compare_y(t: int, chunk: int, weights: str | None):
 
     def compare(actual, expected, **kw):
         ok, detail = gate(actual, expected, **kw)
+        if ok:
+            return True, ""
         y_ref = _draw("y", t, chunk, weights)().reshape(t, -1)
         y_dev = actual.double()
-        print(f"[stats] bf16 y: rel frob {float((y_dev - y_ref).norm() / y_ref.norm()):.3e} vs float64 y, "
-              f"{float((y_dev - expected.double()).norm() / y_ref.norm()):.3e} vs golden", flush=True)
-        return ok, detail
+        head = (f"    bf16 y: rel frob {float((y_dev - y_ref).norm() / y_ref.norm()):.3e} vs float64 y, "
+                f"{float((y_dev - expected.double()).norm() / y_ref.norm()):.3e} vs golden")
+        return False, f"{head}\n{detail}"
 
     return compare
 
@@ -475,14 +483,14 @@ def compare_y(t: int, chunk: int, weights: str | None):
 if __name__ == "__main__":
     import argparse
     import os
-    import statistics
 
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=None, help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--weights", type=str, default=None,
                         help="a real layer from weights.py; default: random weights")
     parser.add_argument("--bf16-out", action="store_true", default=False,
@@ -496,7 +504,10 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
-    if args.seq_len % CHUNK_TILE:
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
+    if args.seq_len and args.seq_len % CHUNK_TILE:
         parser.error(f"--seq-len must be a multiple of CHUNK_TILE={CHUNK_TILE}: this entry's "
                      f"inputs and its gate both come from the chunked block chain, which "
                      f"cannot produce a ragged token count. The kernel takes any count; its "
@@ -507,35 +518,40 @@ if __name__ == "__main__":
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
-    quant = not args.bf16_out
-    if args.fanned and not quant:
-        parser.error("--fanned is the int8 decode form; it has no bf16-output variant")
-    if quant and args.fanned:
-        entry = build_fanned_kernel(args.seq_len)
+    # Four programs live here -- the int8 epilogue and the bf16 one, each in a token-tiled
+    # and a per-token form -- so the default set runs every one of them: the int8 epilogue
+    # at both shapes and the other three once at the smaller.
+    suffix = "_fanned" if args.fanned else ""
+    if args.bf16_out or args.fanned:
+        plan = [(("bf16" if args.bf16_out else "int8") + suffix, t) for t in cases]
     else:
-        entry = gdn_gated_rmsnorm_test if quant else gdn_gated_rmsnorm_bf16_test
-    result = run(
-        fn=entry,
-        specs=build_tensor_specs(t=args.seq_len, weights=args.weights, quant=quant),
-        golden_fn=golden_gdn_gated_rmsnorm if quant else golden_gdn_gated_rmsnorm_bf16,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
-        rtol=1e-3,
-        atol=1e-5,
-        compare_fn=({"y_q": compare_y_q(args.seq_len, CHUNK_TILE, args.weights)} if quant
-                    else {"y": compare_y(args.seq_len, CHUNK_TILE, args.weights)}),
-        compile_only=args.compile_only,
-    )
-    if args.rounds and result.bench is not None:
-        samples = [s for s in result.bench.per_round("effective") if s > 0]
-        if samples:
-            print(f"[bench] gated_rmsnorm{'' if quant else '_bf16'} T={args.seq_len} H={H} "
-                  f"rounds={len(samples)} mean={statistics.fmean(samples):.1f} us "
-                  f"median={statistics.median(samples):.1f} min={min(samples):.1f} "
-                  f"max={max(samples):.1f}", flush=True)
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+        plan = [("int8", t) for t in cases]
+        if not args.seq_len:
+            plan += [("bf16", cases[0]), ("int8_fanned", cases[0]), ("bf16_fanned", cases[0])]
+    for label, t in plan:
+        quant = not label.startswith("bf16")
+        if label.endswith("_fanned"):
+            entry = build_fanned_kernel(t) if quant else build_fanned_bf16_kernel(t)
+        else:
+            entry = gdn_gated_rmsnorm_test if quant else gdn_gated_rmsnorm_bf16_test
+        print(f"[case] gated_rmsnorm {label} T={t}", flush=True)
+        result = run(
+            fn=entry,
+            specs=build_tensor_specs(t=t, weights=args.weights, quant=quant),
+            golden_fn=golden_gdn_gated_rmsnorm if quant else golden_gdn_gated_rmsnorm_bf16,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+            rtol=1e-3,
+            atol=1e-5,
+            compare_fn=({"y_q": compare_y_q(t, CHUNK_TILE, args.weights)} if quant
+                        else {"y": compare_y(t, CHUNK_TILE, args.weights)}),
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            # Stop at the first failure: one device failure poisons the chip run
+            # lane, so every later case reports a failure it did not cause.
+            raise SystemExit(f"FAILED at {label} T={t}")

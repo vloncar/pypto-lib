@@ -60,9 +60,9 @@ import torch
 
 import reference
 import weights as weights_mod
-from config import GDN_QUANT, GDN_TILING, QWEN3_8_27B
+from chunk_cumsum import CHUNK_TILE
+from config import GDN_QUANT, QWEN3_8_27B
 
-CHUNK_TILE = GDN_TILING.chunk
 
 # The W8A8 ablation: what is int8 in each variant. `weights` names the weight
 # set to quantise, or None for bf16.
@@ -222,9 +222,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     # Accepted and ignored: this check is host-only, but CI invokes every runnable
     # file in a model directory as `python <file> -p <platform> -d <card>`.
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3",
                         help="accepted for CI's uniform invocation; nothing here runs on device")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true",
+                        help="accepted for CI's uniform invocation; unused")
     parser.add_argument("-d", "--device", type=int, default=0,
                         help="accepted for CI's uniform invocation; unused")
     parser.add_argument("--seq-len", type=int, default=1024,

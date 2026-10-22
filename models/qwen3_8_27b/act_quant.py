@@ -15,7 +15,7 @@ reduction result is a 4-byte tile ptoas will not allocate.
 """
 import pypto.language as pl
 
-from config import GDN_QUANT, PREFILL_SEQ, QWEN3_8_27B
+from config import GDN_QUANT, QWEN3_8_27B
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -29,7 +29,7 @@ AMAX_EPS = GDN_QUANT.amax_eps
 
 # gate
 MIN_EXACT_VS_GOLDEN = 0.95      # of act_q elements identical to the float64 reference's quantisation
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # tiling
 TOK_TILE = 16           # tokens per block; 16 scalar scale writes fill one 64-byte line
@@ -225,7 +225,7 @@ qwen3_act_quant = pl.jit.inline(_qwen3_act_quant)
 qwen3_act_quant_test = pl.jit(_qwen3_act_quant)
 
 
-def build_tensor_specs(t: int = T, inter: int = INTER, weights: str | None = None):
+def build_tensor_specs(t: int = BENCH_SEQ, inter: int = INTER, weights: str | None = None):
     import torch
     from golden import TensorSpec
 
@@ -286,7 +286,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
     parser.add_argument("--weights", type=str, default=None,
                         help="one layer's BF16 mlp tensors from weights.py; default: random weights")
     parser.add_argument("--save-data", action="store_true", default=False)

@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 try:
-    from .constants import (
+    from .config import (
         FULL_ATTENTION,
         LINEAR_ATTENTION,
         QWEN3_8_27B,
@@ -29,7 +29,7 @@ try:
         dimensions,
     )
 except ImportError:
-    from constants import (
+    from config import (
         FULL_ATTENTION,
         LINEAR_ATTENTION,
         QWEN3_8_27B,

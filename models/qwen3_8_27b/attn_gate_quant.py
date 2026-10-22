@@ -15,7 +15,7 @@ One token at a time, its row viewed as `[HQ, D]`, one head per row.
 """
 import pypto.language as pl
 
-from config import GDN_QUANT, PREFILL_SEQ, QWEN3_8_27B
+from config import GDN_QUANT, QWEN3_8_27B
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -30,7 +30,7 @@ AMAX_EPS = GDN_QUANT.amax_eps
 
 # gate
 MIN_EXACT_VS_GOLDEN = 0.95      # of act_q elements identical to the float64 reference's quantisation
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # tiling
 TOK_TILE = 16           # tokens per block; 16 scalar scale writes fill one 64-byte line
@@ -155,7 +155,7 @@ def build_fanned_kernel(m: int, inline: bool = False):
     return _qwen3_attn_gate_quant_fanned
 
 
-def build_tensor_specs(t: int = T, hq: int = HQ, d: int = D):
+def build_tensor_specs(t: int = BENCH_SEQ, hq: int = HQ, d: int = D):
     import torch
     from golden import TensorSpec
 
@@ -218,7 +218,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
     parser.add_argument("--fanned", action="store_true", default=False,
                         help="the decode form: one task per token")
     parser.add_argument("--save-data", action="store_true", default=False)

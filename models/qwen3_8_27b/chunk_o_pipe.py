@@ -19,7 +19,8 @@ step from the `qs` mailbox slot, which the ring holds until then.
 """
 import pypto.language as pl
 
-from config import GDN_TILING, PREFILL_SEQ, QWEN3_8_27B
+from chunk_cumsum import CHUNK_TILE
+from config import QWEN3_8_27B
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -29,11 +30,10 @@ STATE_DYN = pl.dynamic("GDN_STATE_DYN")     # (T // CHUNK_TILE) * H * D, the sna
 H = QWEN3_8_27B.linear_num_value_heads      # value heads
 HG = QWEN3_8_27B.linear_num_key_heads       # QK heads; H // HG value heads share one
 D = QWEN3_8_27B.linear_value_head_dim       # head dimension
-CHUNK_TILE = GDN_TILING.chunk               # chunk size in tokens, our tiling choice
 GRP = H // HG                               # value heads sharing one key head
 KEY_WIDTH = HG * D
 VAL_WIDTH = H * D
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # a5sim cannot compile the cross-core wait (pto-isa#612).
 
@@ -199,7 +199,7 @@ gdn_chunk_o_pipe = pl.jit.inline(auto_scope=False)(_gdn_chunk_o_pipe)
 gdn_chunk_o_pipe_test = pl.jit(auto_scope=False)(_gdn_chunk_o_pipe)
 
 
-def build_tensor_specs(t: int = T):
+def build_tensor_specs(t: int = BENCH_SEQ):
     import chunk_o
 
     return chunk_o.build_tensor_specs(t=t)
@@ -220,7 +220,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
     parser.add_argument("--rounds", type=int, default=0)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)

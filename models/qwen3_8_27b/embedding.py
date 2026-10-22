@@ -15,7 +15,7 @@ the cores.
 """
 import pypto.language as pl
 
-from config import PREFILL_SEQ, QWEN3_8_27B
+from config import QWEN3_8_27B
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -23,7 +23,7 @@ T_DYN = pl.dynamic("T_DYN")                 # tokens
 # model config
 HIDDEN = QWEN3_8_27B.hidden_size
 VOCAB = QWEN3_8_27B.vocab_size
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # tiling
 # The whole row in one piece. A table row is 10240 bytes and the gather is
@@ -86,7 +86,7 @@ def _banded_normal(rows: int, cols: int, seed: int, scale: float = 1.0):
         out[r0 : r0 + rows_here] = band.to(torch.bfloat16)
     return out
 
-def build_tensor_specs(t: int = T, hidden: int = HIDDEN, vocab: int = VOCAB):
+def build_tensor_specs(t: int = BENCH_SEQ, hidden: int = HIDDEN, vocab: int = VOCAB):
     import torch
     from golden import TensorSpec
 
@@ -119,7 +119,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
     parser.add_argument("--vocab", type=int, default=VOCAB)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)

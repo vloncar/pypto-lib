@@ -25,7 +25,7 @@ from attn_gate_quant import qwen3_attn_gate_quant
 from qk_rmsnorm_rope import qwen3_qk_rmsnorm_rope
 from quant_x import gdn_quant_x
 import attn_core_pipe
-from config import PREFILL_SEQ, QWEN3_8_27B
+from config import QWEN3_8_27B
 
 # model config
 HIDDEN = QWEN3_8_27B.hidden_size
@@ -37,7 +37,7 @@ EPS = QWEN3_8_27B.rms_norm_eps
 QG_WIDTH = 2 * HQ * D           # q_proj: query and gate per head
 KV_WIDTH = HKV * D
 O_WIDTH = HQ * D
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # ci: no-sim
 
@@ -65,7 +65,7 @@ def _patch(blocks: int, cap: int = MAX_GROUP) -> int:
     return 1
 
 
-def build_kernel(t: int = T, inline: bool = False):
+def build_kernel(t: int = BENCH_SEQ, inline: bool = False):
     """The mixer at one shape, composing eight operators as inlined callees.
 
     Static shape only: a packed varlen caller needs a tail, which every
@@ -168,7 +168,7 @@ def _tables(t: int):
     return cos.float(), sin.float(), attn_core.causal_bias(row_tile, kv_tile)
 
 
-def build_tensor_specs(t: int = T, weights: str | None = None):
+def build_tensor_specs(t: int = BENCH_SEQ, weights: str | None = None):
     import torch
     from golden import TensorSpec
 
@@ -270,7 +270,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
     parser.add_argument("--weights", type=str, default=None,
                         help="one layer's BF16 self_attn tensors from weights.py; default: random weights")
     parser.add_argument("--save-data", action="store_true", default=False)

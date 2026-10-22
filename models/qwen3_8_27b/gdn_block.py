@@ -49,7 +49,8 @@ import in_proj_z
 import out_proj
 import short_conv
 import solve_tril
-from config import GDN_TILING, PREFILL_SEQ, QWEN3_8_27B
+from chunk_cumsum import CHUNK_TILE
+from config import QWEN3_8_27B
 
 # model config
 C = QWEN3_8_27B.hidden_size                 # the residual stream
@@ -59,8 +60,10 @@ H = QWEN3_8_27B.linear_num_value_heads
 HG = QWEN3_8_27B.linear_num_key_heads
 D = QWEN3_8_27B.linear_value_head_dim
 KCONV = QWEN3_8_27B.linear_conv_kernel_dim  # convolution taps
-CHUNK_TILE = GDN_TILING.chunk
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+# validation
+# `in_proj_z` binds the floor at M_GROUP * M_TILE. The token count must be a multiple of 2048.
+DEFAULT_CASES = (2048, 4096)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # At T = 8192 the block holds about 1.3 GB of intermediates at once: 0.6 GB
 # inside the delta rule, and the projections, the convolution's three outputs
@@ -75,13 +78,13 @@ HALO_TILE = 1024        # channels per block of the zero fill above the projecti
 
 
 
-def run_config(platform: str = "a2a3", device: int = 0, swimlane: int = 0) -> dict:
+def run_config(backend_type: str = "a2a3", sim: bool = False, device: int = 0, swimlane: int = 0) -> dict:
     """The config `golden.run` needs for this block. The ring heap is not optional."""
-    return dict(platform=platform, device_id=device, ring_heap=BLOCK_RING_HEAP,
-                enable_chip_swimlane=swimlane)
+    return dict(backend_type=backend_type, execution_mode=sim, device_id=device,
+                ring_heap=BLOCK_RING_HEAP, enable_chip_swimlane=swimlane)
 
 
-def build_kernel(t: int = T, h: int = H, hg: int = HG, d: int = D, chunk: int = CHUNK_TILE,
+def build_kernel(t: int = BENCH_SEQ, h: int = H, hg: int = HG, d: int = D, chunk: int = CHUNK_TILE,
                  inline: bool = False):
     """The block at one shape, composing fourteen operators as inlined callees."""
     c, cqkv, cv, k = C, CQKV, CV, KCONV
@@ -166,7 +169,7 @@ def build_kernel(t: int = T, h: int = H, hg: int = HG, d: int = D, chunk: int = 
     return gdn_block
 
 
-def build_tensor_specs(t: int = T, h: int = H, hg: int = HG, d: int = D,
+def build_tensor_specs(t: int = BENCH_SEQ, h: int = H, hg: int = HG, d: int = D,
                        chunk: int = CHUNK_TILE, weights: str | None = None):
     """Every weight the block reads, plus the delta rule's three constants."""
     import torch
@@ -309,6 +312,10 @@ def compare_out(t: int, weights: str | None):
     from the truth and passes both at 1.000x while being twice the floor from
     the answer it should have produced. Two further gates bound the distance to
     `fq` directly, whole-tensor and worst row, in the same floor-relative units.
+
+    The worst-row gate is also what bounds a single element, which is why there is no
+    per-point comparator on top: a row is 5120 wide, so an element wrong by about one
+    row's RMS magnitude already moves that row's relative norm past the bound.
     """
     def compare(actual, expected, **_kwargs):
         dev = actual.double()
@@ -326,18 +333,20 @@ def compare_out(t: int, weights: str | None):
         over, row_over = dev_truth / floor, dev_row / row_floor
         dev_fq, dev_row_fq = rel(dev, fq), worst_row(dev, fq)
         near, row_near = dev_fq / floor, dev_row_fq / row_floor
-        print(f"[stats] out: rel frob {dev_truth:.3e} vs the float64 truth against a "
-              f"quantization floor of {floor:.3e} ({over:.3f}x); worst token row "
-              f"{dev_row:.3e} against {row_floor:.3e} ({row_over:.3f}x); "
-              f"{dev_fq:.3e} vs the fake-quant chain ({near:.3f} of the floor, "
-              f"worst row {row_near:.3f})", flush=True)
         ok = (over <= MAX_OVER_FLOOR and row_over <= MAX_ROW_OVER_FLOOR
               and near <= MAX_VS_GOLDEN and row_near <= MAX_ROW_VS_GOLDEN)
+        if ok:
+            return True, ""
+        head = (f"    out: rel frob {dev_truth:.3e} vs the float64 truth against a "
+                f"quantization floor of {floor:.3e} ({over:.3f}x); worst token row "
+                f"{dev_row:.3e} against {row_floor:.3e} ({row_over:.3f}x); "
+                f"{dev_fq:.3e} vs the fake-quant chain ({near:.3f} of the floor, "
+                f"worst row {row_near:.3f})")
         detail = (f"{over:.3f}x the quantization floor (<={MAX_OVER_FLOOR}), "
                   f"worst row {row_over:.3f}x (<={MAX_ROW_OVER_FLOOR}); "
                   f"vs the fake-quant chain {near:.3f} (<={MAX_VS_GOLDEN}), "
                   f"worst row {row_near:.3f} (<={MAX_ROW_VS_GOLDEN})")
-        return ok, detail
+        return False, f"{head}\n{detail}"
 
     return compare
 
@@ -345,14 +354,14 @@ def compare_out(t: int, weights: str | None):
 if __name__ == "__main__":
     import argparse
     import os
-    import statistics
 
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=None, help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--weights", type=str, default=None,
                         help="a real layer from weights.py; default: random weights")
     parser.add_argument("--rounds", type=int, default=0,
@@ -364,32 +373,35 @@ if __name__ == "__main__":
                         choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if args.seq_len and args.seq_len % 2048:
+        parser.error("--seq-len must be a multiple of 2048")
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
 
     if args.rounds:
         os.environ["PYPTO_BENCH"] = "1"
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
-    result = run(
-        fn=build_kernel(t=args.seq_len),
-        specs=build_tensor_specs(t=args.seq_len, weights=args.weights),
-        golden_fn=golden_gdn_block(args.weights),
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=run_config(args.platform, args.device, args.enable_chip_swimlane),
-        rtol=1e-2,
-        atol=1e-5,
-        compare_fn={"out": compare_out(args.seq_len, args.weights)},
-        compile_only=args.compile_only,
-    )
-    if args.rounds and result.bench is not None:
-        samples = [s for s in result.bench.per_round("effective") if s > 0]
-        if samples:
-            print(f"[bench] gdn_block T={args.seq_len} rounds={len(samples)} "
-                  f"mean={statistics.fmean(samples):.1f} us "
-                  f"median={statistics.median(samples):.1f} min={min(samples):.1f}", flush=True)
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for t in cases:
+        print(f"[case] gdn_block T={t}", flush=True)
+        result = run(
+            fn=build_kernel(t=t),
+            specs=build_tensor_specs(t=t, weights=args.weights),
+            golden_fn=golden_gdn_block(args.weights),
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=run_config(args.backend_type, args.execution_mode, args.device, args.enable_chip_swimlane),
+            rtol=1e-2,
+            atol=1e-5,
+            compare_fn={"out": compare_out(t, args.weights)},
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            # Stop at the first failure: one device failure poisons the chip run
+            # lane, so every later case reports a failure it did not cause.
+            raise SystemExit(f"FAILED at T={t}")

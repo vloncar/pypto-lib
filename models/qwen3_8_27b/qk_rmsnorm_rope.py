@@ -20,7 +20,7 @@ carries the decode value.
 """
 import pypto.language as pl
 
-from config import PREFILL_SEQ, QWEN3_8_27B
+from config import QWEN3_8_27B
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -31,7 +31,7 @@ HKV = QWEN3_8_27B.num_key_value_heads   # KV heads
 D = QWEN3_8_27B.head_dim                # head dimension, the norm's axis
 ROT = QWEN3_8_27B.rotary_dim            # leading dimensions RoPE rotates
 EPS = QWEN3_8_27B.rms_norm_eps
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # tiling
 TOK_TILE = 32           # tokens per work item; the RoPE tables are read once per item
@@ -234,7 +234,7 @@ qwen3_qk_rmsnorm_rope = build_kernel(inline=True)
 qwen3_qk_rmsnorm_rope_test = build_kernel()
 
 
-def build_tensor_specs(t: int = T, hq: int = HQ, hkv: int = HKV, d: int = D, rot: int = ROT):
+def build_tensor_specs(t: int = BENCH_SEQ, hq: int = HQ, hkv: int = HKV, d: int = D, rot: int = ROT):
     import torch
     from golden import TensorSpec
 
@@ -322,7 +322,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
     parser.add_argument("--eps", type=float, default=EPS)
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)

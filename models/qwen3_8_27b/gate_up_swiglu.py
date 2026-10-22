@@ -48,12 +48,12 @@ builds the control that adds no rounding and saves no storage.
 """
 import pypto.language as pl
 
-from config import PREFILL_SEQ, QWEN3_8_27B
+from config import QWEN3_8_27B
 
 # model config
 HIDDEN = QWEN3_8_27B.hidden_size
 INTER = QWEN3_8_27B.intermediate_size
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 # The simulators run each block as one task and their scheduler declares a
 # stall after 20 s without progress, which a full-width pair of projections
 # reaches well before it finishes. 256 tokens run the same code in 42 s.
@@ -77,7 +77,7 @@ M_PREFER = (16, 8, 4, 2, 1)
 EARLY_RESOLVE = True
 
 
-def build_kernel(m: int = T, k: int = HIDDEN, n: int = INTER, name: str = "gate_up_swiglu",
+def build_kernel(m: int = BENCH_SEQ, k: int = HIDDEN, n: int = INTER, name: str = "gate_up_swiglu",
                  inline: bool = False, m_tile: int = M_TILE, n_tile: int = N_TILE,
                  k_tile: int = K_TILE, m_group: int = M_GROUP, n_group: int = N_GROUP,
                  act_dtype=pl.BF16, k_stagger: int = 0, ring_slots: int = 1):
@@ -211,7 +211,7 @@ def build_kernel(m: int = T, k: int = HIDDEN, n: int = INTER, name: str = "gate_
 gdn_gate_up_swiglu = build_kernel()
 
 
-def build_tensor_specs(t: int = T, hidden: int = HIDDEN, inter: int = INTER,
+def build_tensor_specs(t: int = BENCH_SEQ, hidden: int = HIDDEN, inter: int = INTER,
                        act_dtype=None, weights: str | None = None):
     import torch
     from golden import TensorSpec
@@ -275,7 +275,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=None,
-                        help=f"tokens; default {T} on hardware, {SIM_T} on the simulators")
+                        help=f"tokens; default {BENCH_SEQ} on hardware, {SIM_T} on the simulators")
     parser.add_argument("--fp32-act", action="store_true", default=False,
                         help="the control: no added rounding, and no storage saving")
     parser.add_argument("--weights", type=str, default=None,
@@ -293,7 +293,7 @@ if __name__ == "__main__":
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
     act_dtype = pl.FP32 if args.fp32_act else pl.BF16
-    seq_len = args.seq_len or (SIM_T if args.platform.endswith("sim") else T)
+    seq_len = args.seq_len or (SIM_T if args.platform.endswith("sim") else BENCH_SEQ)
     m_group = args.m_group
     if (seq_len // M_TILE) % m_group:
         m_group = next(side for side in M_PREFER if (seq_len // M_TILE) % side == 0)

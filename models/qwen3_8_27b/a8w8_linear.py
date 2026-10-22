@@ -202,14 +202,16 @@ def compare_y(truth_fn, fakequant_fn, label: str):
 
     def compare(actual, expected, **kw):
         ok, detail = gate(actual, expected, **kw)
+        if ok:
+            return True, ""
         dev = actual.double()
         fq = fakequant_fn()
         truth = truth_fn()
-        print(f"[stats] {label}: rel frob {float((dev - fq).norm() / fq.norm()):.3e} vs the "
-              f"float64 W8A8 chain, {float((dev - truth).norm() / truth.norm()):.3e} vs the "
-              f"float64 truth; quantization alone costs "
-              f"{float((fq - truth).norm() / truth.norm()):.3e}", flush=True)
-        return ok, detail
+        head = (f"    {label}: rel frob {float((dev - fq).norm() / fq.norm()):.3e} vs the "
+                  f"float64 W8A8 chain, {float((dev - truth).norm() / truth.norm()):.3e} vs the "
+                f"float64 truth; quantization alone costs "
+                f"{float((fq - truth).norm() / truth.norm()):.3e}")
+        return False, f"{head}\n{detail}"
 
     return compare
 
@@ -313,12 +315,14 @@ def build_specs(m: int, k: int, n: int, a_q_fn, a_scale_fn, w_q_fn, w_scale_fn):
     ]
 
 
-def add_args(parser, m_tile: int, n_tile: int, k_tile: int, t: int,
+def add_args(parser, m_tile: int, n_tile: int, k_tile: int,
              m_group: int = M_GROUP, n_group: int = N_GROUP):
-    """The CLI every instance shares."""
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    """The CLI every instance shares. The shape comes from the entry's DEFAULT_CASES."""
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=t)
+    parser.add_argument("--seq-len", type=int, default=None,
+                        help="one shape instead of the entry's DEFAULT_CASES")
     parser.add_argument("--weights", type=str, default=None,
                         help="a real layer from weights.py; default: random weights")
     parser.add_argument("--m-tile", type=int, default=m_tile)
@@ -335,8 +339,12 @@ def add_args(parser, m_tile: int, n_tile: int, k_tile: int, t: int,
     return parser
 
 
-def report(label: str, args, result, k: int, n: int):
-    """One `[bench]` line with the shape, the tiles and the achieved rate."""
+def report(label: str, t: int, args, result, k: int, n: int):
+    """The achieved rate for the shape and tiles, which the harness cannot derive.
+
+    The harness already prints the per-round statistics, so this adds only what it
+    does not know: the matmul's shape, the tiles it ran with, and the rate those imply.
+    """
     import statistics
 
     if not args.rounds or result.bench is None:
@@ -344,11 +352,8 @@ def report(label: str, args, result, k: int, n: int):
     samples = [s for s in result.bench.per_round("effective") if s > 0]
     if not samples:
         return
-    mean = statistics.fmean(samples)
     # 2 ops per MAC, the convention every TOPS figure uses
-    tops = 2 * args.seq_len * k * n / (mean * 1e-6) / 1e12
-    print(f"[bench] {label} M={args.seq_len} K={k} N={n} "
+    tops = 2 * t * k * n / (statistics.fmean(samples) * 1e-6) / 1e12
+    print(f"[bench] {label} M={t} K={k} N={n} "
           f"m={args.m_tile} n={args.n_tile} k={args.k_tile} "
-          f"patch={args.m_group}x{args.n_group} rounds={len(samples)} "
-          f"mean={mean:.1f} us median={statistics.median(samples):.1f} "
-          f"min={min(samples):.1f} -> {tops:.1f} TOPS", flush=True)
+          f"patch={args.m_group}x{args.n_group} -> {tops:.1f} TOPS", flush=True)

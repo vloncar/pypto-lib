@@ -19,7 +19,7 @@ doing nothing. `decode_vector.py` carries the decode value.
 """
 import pypto.language as pl
 
-from config import PREFILL_SEQ, QWEN3_8_27B
+from config import QWEN3_8_27B
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
@@ -28,7 +28,7 @@ T_DYN = pl.dynamic("T_DYN")  # T = B * S
 HIDDEN = QWEN3_8_27B.hidden_size            # the axis the norm reduces over
 HIDDEN_INV = 1.0 / HIDDEN
 EPS = QWEN3_8_27B.rms_norm_eps
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # tiling
 TOK_TILE = 64           # tokens per block
@@ -302,7 +302,7 @@ def build_fanned_residual_kernel(m: int, col_groups: int = COL_GROUPS,
     return _qwen3_residual_rmsnorm_fanned
 
 
-def build_tensor_specs(t: int = T, hidden: int = HIDDEN):
+def build_tensor_specs(t: int = BENCH_SEQ, hidden: int = HIDDEN):
     import torch
     from golden import TensorSpec
 
@@ -322,7 +322,7 @@ def build_tensor_specs(t: int = T, hidden: int = HIDDEN):
     ]
 
 
-def build_residual_tensor_specs(t: int = T, hidden: int = HIDDEN):
+def build_residual_tensor_specs(t: int = BENCH_SEQ, hidden: int = HIDDEN):
     """The five tensors `build_residual_kernel` and its fanned form share."""
     import torch
     from golden import TensorSpec
@@ -416,7 +416,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--mode", type=str, default="plain", choices=["plain", "residual", "fanned"],
                         help="the plain norm, the fused add-and-norm, or its decode fan-out")
-    parser.add_argument("--seq-len", type=int, default=T, help="tokens, or the padded batch for --mode fanned")
+    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ, help="tokens, or the padded batch for --mode fanned")
     parser.add_argument("--col-groups", type=int, default=COL_GROUPS, help="--mode fanned only")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)

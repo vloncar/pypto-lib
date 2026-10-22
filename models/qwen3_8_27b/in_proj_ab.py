@@ -18,7 +18,7 @@ carries the decode value.
 """
 import pypto.language as pl
 
-from config import PREFILL_SEQ, QWEN3_8_27B
+from config import QWEN3_8_27B
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -28,7 +28,10 @@ K = QWEN3_8_27B.hidden_size                 # contraction: the block's input wid
 H = QWEN3_8_27B.linear_num_value_heads      # one scalar per value head, twice over
 
 MODULES = ("in_proj_a", "in_proj_b")
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+# validation
+# one M_TILE of tokens, then two. The token count must be a multiple of 128.
+DEFAULT_CASES = (128, 256)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # tiling
 M_TILE = 128            # token rows per block
@@ -103,7 +106,7 @@ def _stacked_weight(weights: str | None):
     return load
 
 
-def build_tensor_specs(t: int = T, k: int = K, h: int = H, weights: str | None = None,
+def build_tensor_specs(t: int = BENCH_SEQ, k: int = K, h: int = H, weights: str | None = None,
                        **_):
     import torch
     from golden import TensorSpec
@@ -135,13 +138,15 @@ def compare(name: str, t: int, weights: str | None):
 
     def compare_fn(actual, expected, **kw):
         ok, detail = gate(actual, expected, **kw)
+        if ok:
+            return True, ""
         a8w8_linear.host_torch_setup()
         w = a8w8_linear.load_weights(QWEN3_8_27B, weights)[module + ".weight"]
         ref = reference.linear(reference.make_block_inputs(t, QWEN3_8_27B), w)
         dev = actual.double()
-        print(f"[stats] {name}: rel frob {float((dev - ref).norm() / ref.norm()):.3e} "
-              f"vs the float64 projection", flush=True)
-        return ok, detail
+        head = (f"    {name}: rel frob {float((dev - ref).norm() / ref.norm()):.3e} "
+                  f"vs the float64 projection")
+        return False, f"{head}\n{detail}"
 
     return compare_fn
 
@@ -149,14 +154,14 @@ def compare(name: str, t: int, weights: str | None):
 if __name__ == "__main__":
     import argparse
     import os
-    import statistics
 
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=None, help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--weights", type=str, default=None,
                         help="a real layer from weights.py; default: random weights")
     parser.add_argument("--k-tile", type=int, default=K_TILE)
@@ -167,7 +172,10 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
-    if args.seq_len % M_TILE:
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
+    if args.seq_len and args.seq_len % M_TILE:
         parser.error(f"--seq-len must be a multiple of M_TILE={M_TILE}")
 
     if args.rounds:
@@ -175,29 +183,25 @@ if __name__ == "__main__":
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
-    result = run(
-        fn=gdn_in_proj_ab_test,
-        specs=build_tensor_specs(t=args.seq_len, weights=args.weights),
-        golden_fn=golden_fn,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
-        rtol=1e-3,
-        atol=1e-5,
-        compare_fn={"a_proj": compare("a_proj", args.seq_len, args.weights),
-                    "b_proj": compare("b_proj", args.seq_len, args.weights)},
-        compile_only=args.compile_only,
-    )
-    if args.rounds and result.bench is not None:
-        samples = [s for s in result.bench.per_round("effective") if s > 0]
-        if samples:
-            print(f"[bench] in_proj_ab M={args.seq_len} K={K} N={2 * H} "
-                  f"m={M_TILE} k={K_TILE} rounds={len(samples)} "
-                  f"mean={statistics.fmean(samples):.1f} us "
-                  f"median={statistics.median(samples):.1f} min={min(samples):.1f}",
-                  flush=True)
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for t in cases:
+        print(f"[case] in_proj_ab T={t}", flush=True)
+        result = run(
+            fn=gdn_in_proj_ab_test,
+            specs=build_tensor_specs(t=t, weights=args.weights),
+            golden_fn=golden_fn,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+            rtol=1e-3,
+            atol=1e-5,
+            compare_fn={"a_proj": compare("a_proj", t, args.weights),
+                        "b_proj": compare("b_proj", t, args.weights)},
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            # Stop at the first failure: one device failure poisons the chip run
+            # lane, so every later case reports a failure it did not cause.
+            raise SystemExit(f"FAILED at T={t}")

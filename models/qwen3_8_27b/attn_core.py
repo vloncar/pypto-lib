@@ -16,7 +16,7 @@ output accumulates as two halves.
 """
 import pypto.language as pl
 
-from config import PREFILL_SEQ, QWEN3_8_27B
+from config import QWEN3_8_27B
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -25,7 +25,7 @@ T_DYN = pl.dynamic("T_DYN")                 # tokens
 HQ = QWEN3_8_27B.num_attention_heads    # query heads
 HKV = QWEN3_8_27B.num_key_value_heads   # KV heads
 D = QWEN3_8_27B.head_dim                # head dimension
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 # The simulators run the whole core as one task, and their scheduler declares a
 # stall after 20 s without progress: at T = 8192 that kills the run long before
 # the simulated kernel finishes. 1024 runs the same code -- both diagonal
@@ -161,7 +161,7 @@ qwen3_attn_core_test = pl.jit(_qwen3_attn_core)
 SCORE_STD = 4.0
 
 
-def build_tensor_specs(t: int = T, hq: int = HQ, hkv: int = HKV, d: int = D,
+def build_tensor_specs(t: int = BENCH_SEQ, hq: int = HQ, hkv: int = HKV, d: int = D,
                        row_tile: int = ROW_TILE, kv_tile: int = KV_TILE):
     import torch
     from golden import TensorSpec
@@ -223,13 +223,13 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=None,
-                        help=f"tokens; default {T} on hardware, {SIM_T} on the simulators")
+                        help=f"tokens; default {BENCH_SEQ} on hardware, {SIM_T} on the simulators")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
 
-    t = args.seq_len or (SIM_T if args.platform.endswith("sim") else T)
+    t = args.seq_len or (SIM_T if args.platform.endswith("sim") else BENCH_SEQ)
     if t % KV_TILE:
         parser.error(f"--seq-len must be a multiple of KV_TILE={KV_TILE}")
     result = run(

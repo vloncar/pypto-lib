@@ -17,14 +17,17 @@ staying quantized.
 """
 import a8w8_linear
 
-from config import PREFILL_SEQ, QWEN3_8_27B
+from config import QWEN3_8_27B
 
 # model config
 K = QWEN3_8_27B.hidden_size                 # contraction: the block's input width
 N = QWEN3_8_27B.qkv_width                   # q and k at Hg heads, v at H
 
 MODULE = "in_proj_qkv"
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+# validation
+# one block of M_GROUP * M_TILE token rows, then two. The token count must be a multiple of 512.
+DEFAULT_CASES = (512, 1024)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # tiling
 M_TILE = 128
@@ -37,7 +40,7 @@ N_GROUP = 2
 
 
 
-def build_kernel(t: int = T, k: int = K, n: int = N, inline: bool = False,
+def build_kernel(t: int = BENCH_SEQ, k: int = K, n: int = N, inline: bool = False,
                  m_tile: int = M_TILE, n_tile: int = N_TILE, k_tile: int = K_TILE,
                  m_group: int = M_GROUP, n_group: int = N_GROUP, row_off: int = 0):
     return a8w8_linear.build_kernel(t, k, n, name=MODULE, inline=inline, m_tile=m_tile,
@@ -46,7 +49,7 @@ def build_kernel(t: int = T, k: int = K, n: int = N, inline: bool = False,
                                     k_stagger=K_STAGGER, ring_slots=RING_SLOTS)
 
 
-def build_tensor_specs(t: int = T, k: int = K, n: int = N, weights: str | None = None,
+def build_tensor_specs(t: int = BENCH_SEQ, k: int = K, n: int = N, weights: str | None = None,
                        **_):
     act = a8w8_linear.hidden_activation(QWEN3_8_27B, t, weights)
     w_q, w_scale = a8w8_linear.quantized_weight(QWEN3_8_27B, MODULE, weights)
@@ -66,30 +69,40 @@ if __name__ == "__main__":
 
     from golden import run
 
-    args = a8w8_linear.add_args(
+    parser = a8w8_linear.add_args(
         argparse.ArgumentParser(description=__doc__.splitlines()[0]),
-        M_TILE, N_TILE, K_TILE, T, M_GROUP, N_GROUP).parse_args()
+        M_TILE, N_TILE, K_TILE, M_GROUP, N_GROUP)
+    args = parser.parse_args()
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if args.seq_len and args.seq_len % 512:
+        parser.error("--seq-len must be a multiple of 512")
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
     if args.rounds:
         os.environ["PYPTO_BENCH"] = "1"
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
-    result = run(
-        fn=build_kernel(t=args.seq_len, m_tile=args.m_tile, n_tile=args.n_tile,
-                        k_tile=args.k_tile, m_group=args.m_group, n_group=args.n_group),
-        specs=build_tensor_specs(t=args.seq_len, weights=args.weights),
-        golden_fn=a8w8_linear.golden_fn,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
-        rtol=1e-3,
-        atol=1e-5,
-        compare_fn={"y": compare_y(args.seq_len, args.weights)},
-        compile_only=args.compile_only,
-    )
-    a8w8_linear.report("in_proj_qkv", args, result, K, N)
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    for t in cases:
+        print(f"[case] in_proj_qkv T={t}", flush=True)
+        result = run(
+            fn=build_kernel(t=t, m_tile=args.m_tile, n_tile=args.n_tile,
+                            k_tile=args.k_tile, m_group=args.m_group, n_group=args.n_group),
+            specs=build_tensor_specs(t=t, weights=args.weights),
+            golden_fn=a8w8_linear.golden_fn,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+            rtol=1e-3,
+            atol=1e-5,
+            compare_fn={"y": compare_y(t, args.weights)},
+            compile_only=args.compile_only,
+        )
+        a8w8_linear.report("in_proj_qkv", t, args, result, K, N)
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            # Stop at the first failure: one device failure poisons the chip run
+            # lane, so every later case reports a failure it did not cause.
+            raise SystemExit(f"FAILED at T={t}")

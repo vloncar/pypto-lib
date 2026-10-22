@@ -21,14 +21,14 @@ import pypto.language as pl
 import a8w8_linear
 import gate_up_swiglu
 from act_quant import qwen3_act_quant
-from config import PREFILL_SEQ, QWEN3_8_27B
+from config import QWEN3_8_27B
 from quant_x import gdn_quant_x
 from swiglu_quant import qwen3_swiglu_quant
 
 # model config
 HIDDEN = QWEN3_8_27B.hidden_size
 INTER = QWEN3_8_27B.intermediate_size
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # ci: no-sim
 
@@ -110,7 +110,7 @@ def _patch(blocks: int, prefer: tuple[int, ...]) -> int:
     return prefer[-1]
 
 
-def build_kernel(t: int = T, hidden: int = HIDDEN, inter: int = INTER,
+def build_kernel(t: int = BENCH_SEQ, hidden: int = HIDDEN, inter: int = INTER,
                  fused: bool = True, inline: bool = False):
     """The MLP at one shape, composing its operators as inlined callees.
 
@@ -220,7 +220,7 @@ def build_kernel(t: int = T, hidden: int = HIDDEN, inter: int = INTER,
 qwen3_mlp = build_kernel()
 
 
-def build_tensor_specs(t: int = T, hidden: int = HIDDEN, inter: int = INTER,
+def build_tensor_specs(t: int = BENCH_SEQ, hidden: int = HIDDEN, inter: int = INTER,
                        weights: str | None = None):
     import torch
     from golden import TensorSpec
@@ -337,7 +337,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
     parser.add_argument("--unfused", action="store_true", default=False,
                         help="two projections and swiglu_quant, the form Q6g replaced")
     parser.add_argument("--weights", type=str, default=None,

@@ -28,12 +28,12 @@ it anyway would cost. Running this file exercises that shape.
 """
 import pypto.language as pl
 
-from config import PREFILL_SEQ, QWEN3_8_27B
+from config import QWEN3_8_27B
 
 # model config
 K = QWEN3_8_27B.value_width                 # contraction: H value heads of D
 N = QWEN3_8_27B.hidden_size                 # back to the residual stream
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # tiling defaults; each instance overrides them
 M_TILE = 128            # token rows per output tile
@@ -146,7 +146,7 @@ def compare_y(actual, expected, **_kwargs):
 # ---------------------------------------------------------------------------
 
 
-def build_specs(t: int = T, k: int = K, n: int = N, weights: str | None = None):
+def build_specs(t: int = BENCH_SEQ, k: int = K, n: int = N, weights: str | None = None):
     """The projection's inputs: a real layer's BF16 `out_proj` when given one.
 
     The activation is drawn rather than taken from the block chain. This file
@@ -183,7 +183,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=BENCH_SEQ)
     parser.add_argument("--weights", type=str, default=None,
                         help="a real GDN layer from weights.py; default: random weights")
     parser.add_argument("--k-tile", type=int, default=K_TILE)

@@ -23,7 +23,7 @@ of `ROW_TILE`, and the vector side keeps a separate accumulator per block.
 """
 import pypto.language as pl
 
-from config import PREFILL_SEQ, QWEN3_8_27B
+from config import QWEN3_8_27B
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
@@ -32,7 +32,7 @@ T_DYN = pl.dynamic("T_DYN")                 # tokens
 HQ = QWEN3_8_27B.num_attention_heads    # query heads
 HKV = QWEN3_8_27B.num_key_value_heads   # KV heads
 D = QWEN3_8_27B.head_dim                # head dimension
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # a5sim cannot compile the cross-core wait (pto-isa#612).
 
@@ -251,7 +251,7 @@ qwen3_attn_core_pipe = pl.jit.inline(auto_scope=False)(_qwen3_attn_core_pipe)
 qwen3_attn_core_pipe_test = pl.jit(auto_scope=False)(_qwen3_attn_core_pipe)
 
 
-def build_tensor_specs(t: int = T, hq: int = HQ, hkv: int = HKV, d: int = D,
+def build_tensor_specs(t: int = BENCH_SEQ, hq: int = HQ, hkv: int = HKV, d: int = D,
                        row_tile: int = ROW_TILE, kv_tile: int = KV_TILE):
     import attn_core
 
@@ -288,7 +288,7 @@ if __name__ == "__main__":
 
     import attn_core
 
-    seq_len = args.seq_len or (attn_core.SIM_T if args.platform.endswith("sim") else T)
+    seq_len = args.seq_len or (attn_core.SIM_T if args.platform.endswith("sim") else BENCH_SEQ)
     if seq_len % KV_TILE:
         parser.error(f"--seq-len must be a multiple of KV_TILE={KV_TILE}")
     compile_only = args.compile_only

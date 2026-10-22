@@ -17,19 +17,22 @@ nothing. `decode_vector.py` carries the decode values.
 """
 import pypto.language as pl
 
-from config import GDN_QUANT, GDN_TILING, PREFILL_SEQ, QWEN3_8_27B
+from chunk_cumsum import CHUNK_TILE
+from config import GDN_QUANT, QWEN3_8_27B
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
 
 # model config
 C = QWEN3_8_27B.hidden_size                 # the block's input width
-CHUNK_TILE = GDN_TILING.chunk               # only picks the reference chain to draw from
 
 # quantization
 SCALE_MAX = GDN_QUANT.scale_max
 AMAX_EPS = GDN_QUANT.amax_eps
-T = PREFILL_SEQ                             # tokens (single sequence, B = 1)
+# validation
+# the chunk the fixture is built in, then eight. The token count must be a multiple of 128.
+DEFAULT_CASES = (128, 1024)
+BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # gate
 MIN_EXACT_VS_REFERENCE = 0.999  # of x_q elements identical to the fake-quant reference
@@ -275,7 +278,7 @@ def golden_gdn_quant_x(tensors):
     tensors["x_scale"].copy_(scale.reshape(1, -1))
 
 
-def build_tensor_specs(t: int = T, c: int = C, chunk: int = CHUNK_TILE,
+def build_tensor_specs(t: int = BENCH_SEQ, c: int = C, chunk: int = CHUNK_TILE,
                        weights: str | None = None):
     import torch
     from golden import TensorSpec
@@ -314,33 +317,40 @@ def compare_x_q(t: int, chunk: int, weights: str | None):
             detail += (f"; only {exact * 100:.4f}% exact "
                        f"(< {MIN_EXACT_VS_REFERENCE * 100:.1f}%): a systematic "
                        f"rounding change, not boundary flips")
-        print(f"[stats] x_q: {exact * 100:.4f}% exact "
-              f"(gate {MIN_EXACT_VS_REFERENCE * 100:.1f}%), max {int(step.max())} step(s) off",
-              flush=True)
-        return ok, detail
+        if ok:
+            return True, ""
+        head = (f"    x_q: {exact * 100:.4f}% exact "
+                f"(gate {MIN_EXACT_VS_REFERENCE * 100:.1f}%), max {int(step.max())} step(s) off")
+        return False, f"{head}\n{detail}"
 
     return compare
 
 
 def compare_x_scale(actual, expected, **kw):
-    """The scale carries the whole dequantization, so it is held to fp32 rounding."""
-    rel = float(((actual.float() - expected.float()).abs() / expected.float()).max())
-    print(f"[stats] x_scale: max rel diff {rel:.3e}", flush=True)
-    return rel <= 1e-6, f"max rel diff {rel:.3e} (<=1e-6)"
+    """The scale carries the whole dequantization, so it is held to fp32 rounding.
+
+    `max_error_ratio=0` because there is no outlier budget here: every scale has to be
+    right, and the comparator's own non-finite rejection comes with it.
+    """
+    from golden import ratio_allclose
+
+    return ratio_allclose(atol=0.0, rtol=1e-6, max_error_ratio=0.0)(actual, expected, **kw)
 
 
 if __name__ == "__main__":
     import argparse
     import os
-    import statistics
 
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--seq-len", type=int, default=T)
+    parser.add_argument("--seq-len", type=int, default=None, help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--ch-tile", type=int, default=CH_TILE)
+    parser.add_argument("--fanned", action="store_true", default=False,
+                        help="only the per-token form, one task per token")
     parser.add_argument("--rounds", type=int, default=0,
                         help="also time the kernel over this many rounds (device only)")
     parser.add_argument("--save-data", action="store_true", default=False)
@@ -348,34 +358,42 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
+    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    if args.seq_len and args.seq_len % 128:
+        parser.error("--seq-len must be a multiple of 128")
+    if len(cases) > 1 and (args.golden_data or args.runtime_dir):
+        parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
 
     if args.rounds:
         os.environ["PYPTO_BENCH"] = "1"
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
         os.environ["PYPTO_BENCH_WARMUP"] = "5"
 
-    result = run(
-        fn=gdn_quant_x_test,
-        specs=build_tensor_specs(t=args.seq_len),
-        golden_fn=golden_gdn_quant_x,
-        golden_data=args.golden_data,
-        runtime_dir=args.runtime_dir,
-        save_data=args.save_data,
-        config=dict(platform=args.platform, device_id=args.device),
-        rtol=1e-3,
-        atol=1e-5,
-        compare_fn={"x_q": compare_x_q(args.seq_len, CHUNK_TILE, None),
-                    "x_scale": compare_x_scale},
-        compile_only=args.compile_only,
-    )
-    if args.rounds and result.bench is not None:
-        samples = [s for s in result.bench.per_round("effective") if s > 0]
-        if samples:
-            print(f"[bench] quant_x T={args.seq_len} C={C} tok={TOK_TILE} "
-                  f"ch={CH_TILE} grp={GROUP} rounds={len(samples)} "
-                  f"mean={statistics.fmean(samples):.1f} us "
-                  f"median={statistics.median(samples):.1f} min={min(samples):.1f}", flush=True)
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    # Two programs live here, the token-tiled form and the per-token one the decode path
+    # reads, so the default set runs both rather than leaving the second uncovered.
+    plan = [("fanned", t) for t in cases] if args.fanned else [("tiled", t) for t in cases]
+    if not args.fanned and not args.seq_len:
+        plan += [("fanned", cases[0])]
+
+    for label, t in plan:
+        print(f"[case] quant_x {label} T={t}", flush=True)
+        result = run(
+            fn=build_fanned_kernel(t) if label == "fanned" else gdn_quant_x_test,
+            specs=build_tensor_specs(t=t),
+            golden_fn=golden_gdn_quant_x,
+            golden_data=args.golden_data,
+            runtime_dir=args.runtime_dir,
+            save_data=args.save_data,
+            config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
+            rtol=1e-3,
+            atol=1e-5,
+            compare_fn={"x_q": compare_x_q(t, CHUNK_TILE, None),
+                        "x_scale": compare_x_scale},
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            # Stop at the first failure: one device failure poisons the chip run
+            # lane, so every later case reports a failure it did not cause.
+            raise SystemExit(f"FAILED at {label} T={t}")

@@ -25,7 +25,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from models.qwen3_8_27b import reference, weights
-from models.qwen3_8_27b.constants import (
+from models.qwen3_8_27b.config import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
     QWEN3_8_27B,
