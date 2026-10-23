@@ -33,10 +33,10 @@ VAL_WIDTH = H * D                           # one token's contiguous run
 SCALE_MAX = GDN_QUANT.scale_max
 AMAX_EPS = GDN_QUANT.amax_eps
 # validation
-# One chunk of the fixture's chain, then eight. The token count must be a multiple
-# of CHUNK_TILE, and the bf16 and fanned bodies are separate programs, so the
-# default set runs each of them once rather than leaving two uncovered.
+# One chunk of the fixture's chain, then eight; the bf16 and fanned bodies are separate
+# programs, so the default set runs each of them once rather than leaving two uncovered.
 DEFAULT_CASES = (128, 1024)
+TAIL_SEQ = 17           # one token past a tile: the clamped tail of both token-tiled bodies
 BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # gate
@@ -342,22 +342,27 @@ def golden_gdn_gated_rmsnorm_bf16(tensors):
 def _draw(key: str, t: int, chunk: int, weights: str | None):
     """A block-chain tensor as a lazy spec value; one chain serves every spec and the compare.
 
-    **This entry cannot present a token count that is not a multiple of `chunk`.** The chain
-    slices `k[t0 : t0 + chunk]` against a `[chunk, chunk]` mask, so a ragged `t` raises from
-    `reference.kkt` while drawing the fixtures, and `compare_y_q` re-enters the same chain, so
-    decoupling the fixtures alone is not enough -- it only moves the failure into the gate.
-    `rms_lm_head.py`'s row tail is testable because its golden is a pure function of its
-    inputs; this stage's gate is not.
+    **A ragged token count draws the chain at the next chunk multiple and keeps the first `t`
+    rows.** The chain cannot produce a ragged count itself -- it slices `k[t0 : t0 + chunk]`
+    against a `[chunk, chunk]` mask, so a ragged `t` raises from `reference.kkt` -- but this
+    stage is token-local: each row's result is a pure function of that row, and `y`, `y_q`
+    and `y_scale` are per-token, so the first `t` rows of the padded chain are exactly the
+    reference for a ragged `t`. The kernel's clamped tail (G3.1) is therefore testable here,
+    in the stage that owns it, and at the chain's own distribution rather than a drawn one.
 
-    The kernel itself takes any token count (G3.1), and the **composed block is where that is
-    exercised**: `gdn_block` feeds this stage from the same chain, so the tail is covered
-    there rather than here. In production no token-local stage sees a ragged count at all --
-    G4.2 packs each row to a multiple of 256.
+    No composed chain reaches it: every stage of the delta rule tiles the token axis by
+    `chunk`, so `gdn_block` and `prefill_layer` only ever hand this stage whole tiles. In
+    production nothing hands it a ragged count either -- G4.2 packs each row to a multiple
+    of 256.
     """
     import reference
 
     # quant_y=True so the same cached chain also carries y_q / y_scale for the gate
-    return reference.block_inputs(key, t, QWEN3_8_27B, chunk, weights=weights, quant_y=True)
+    t_pad = -(-t // chunk) * chunk
+    src = reference.block_inputs(key, t_pad, QWEN3_8_27B, chunk, weights=weights, quant_y=True)
+    if t_pad == t:
+        return src
+    return lambda: src()[:t]   # every key's dim 0 is the token axis, `y_scale` included
 
 
 def _norm_weight(weights: str | None):
@@ -507,12 +512,6 @@ if __name__ == "__main__":
     cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
     if len(cases) > 1 and (args.golden_data or args.runtime_dir):
         parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
-    if args.seq_len and args.seq_len % CHUNK_TILE:
-        parser.error(f"--seq-len must be a multiple of CHUNK_TILE={CHUNK_TILE}: this entry's "
-                     f"inputs and its gate both come from the chunked block chain, which "
-                     f"cannot produce a ragged token count. The kernel takes any count; its "
-                     f"tail is covered by the composed block.")
-
     if args.rounds:
         os.environ["PYPTO_BENCH"] = "1"
         os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
@@ -528,6 +527,9 @@ if __name__ == "__main__":
         plan = [("int8", t) for t in cases]
         if not args.seq_len:
             plan += [("bf16", cases[0]), ("int8_fanned", cases[0]), ("bf16_fanned", cases[0])]
+            # and the clamped tail in both token-tiled bodies: the fanned ones take any
+            # token count by construction, one task per token and no tile to fall short of.
+            plan += [("int8", TAIL_SEQ), ("bf16", TAIL_SEQ)]
     for label, t in plan:
         quant = not label.startswith("bf16")
         if label.endswith("_fanned"):
