@@ -138,8 +138,46 @@ rounding is unchanged in absolute terms, so it is a larger fraction of a
 floor half the size. In absolute terms the block moved **closer** to the
 chain it implements, 1.88e-02 to 5.43e-03.
 
-Still out of scope here: variable-length batches (one sequence, `B = 1`), and
-everything in the layer outside the Gated DeltaNet block itself.
+Still out of scope here: variable-length batches (one sequence, `B = 1`).
+
+## The decoder layer
+
+[prefill_layer.py](../../../models/qwen3_8_27b/prefill_layer.py) wraps either
+mixer in the rest of a decoder layer: the input norm, the mixer, the
+post-attention norm and the MLP. Each norm is `rmsnorm`'s fused add-and-norm,
+which reads the running residual and the previous stage's delta and writes both
+the new residual and the normed stream, so **the layer boundary sits one
+addition behind the module boundary**: `(residual, delta)` in,
+`(residual_out, mlp_out)` out. The residual runs in FP32 and everything else in
+BF16 -- bf16 has eight mantissa bits, and a 64-layer accumulation would spend
+half of them. `--kind gdn` composes `gdn_block`, `--kind attn` composes
+`gated_attention`, and both are gated against `reference.residual_layer`, which
+takes the mixer as a callable and serves the decode path too.
+
+**The chunk a layer accepts, and what it costs** (a2a3, one card, one grant, a
+real layer's weights resident, five rounds after two warmup, median):
+
+| tokens | ring 1 | GDN layer | per token | attention layer | per token |
+|---|---|---|---|---|---|
+| 2048 | 4 GiB | | | 4.83 ms | 2.358 us |
+| 8192 | 4 GiB | 19.56 ms | 2.388 us | 19.73 ms | 2.409 us |
+| 16384 | 8 GiB | 40.41 ms | 2.467 us | 49.84 ms | 3.042 us |
+| 32768 | 16 GiB | 82.27 ms | 2.511 us | 139.27 ms | 4.250 us |
+| 65536 | 32 GiB | 171.03 ms | 2.610 us | 487.82 ms | 7.443 us |
+| 98304 | 32 GiB | 258.08 ms | 2.625 us | | |
+
+The attention layer needs less: 4 GiB carries it to 16384 and 8 GiB to 32768.
+Each heap above 4 GiB in that table was taken because the half-size heap
+**failed mid-run** -- as a generic AICPU exception, not as an allocation error,
+so a short ring heap looks like a device fault. `ring_heap` is per ring and must
+be a power of two, so the four-entry list raises ring 1 alone and leaves the
+other three at their defaults; 98304 was not probed below 32 GiB, and 4 GiB is
+the entry's own default rather than a measured floor.
+
+The GDN layer is **linear** in the token count, 2.39 to 2.63 us per token over a
+twelvefold range, and the attention layer is **quadratic**, 2.36 to 7.44. The
+chunk is therefore chosen by the attention path and by what the ring heap leaves
+for the resident weights, not by the GDN path.
 
 ## The short convolution
 
