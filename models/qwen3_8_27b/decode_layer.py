@@ -311,7 +311,7 @@ def build_kernel(kind: str, batch: int, **kwargs):
 
 __all__ = ["KINDS", "build_attn_kernel", "build_gdn_kernel",
            "build_kernel", "build_tensor_specs", "compare_fns", "gdn_weights",
-           "golden_decode_layer", "mixer_oracle", "real_layer_paths", "run_config", "truth"]
+           "golden_decode_layer", "mixer_oracle", "run_config", "truth"]
 
 
 def build_tensor_specs(kind: str, batch: int = 16, weights: str | None = None,
@@ -575,25 +575,10 @@ def compare_fns(kind: str) -> dict:
     return gates
 
 
-def real_layer_paths(layer: int, kind: str) -> dict:
-    """The three dumps one real layer needs, by the names `weights.py --fetch` writes."""
-    import weights
-
-    groups = {"weights": "linear_attn" if kind == "gdn" else "self_attn",
-              "mlp_weights": "mlp", "norm_weights": "norms"}
-    out = {}
-    for key, group in groups.items():
-        path = weights.default_path(layer, mixer=group)
-        if not path.is_file():
-            raise SystemExit(f"[decode_layer] {path} is not on disk; fetch it with\n"
-                             f"  python weights.py --fetch --layer {layer} --mixer {group}")
-        out[key] = str(path)
-    return out
-
-
 if __name__ == "__main__":
     import argparse
 
+    import weights
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -619,7 +604,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     cases = [args.batch] if args.batch else list(DEFAULT_CASES)
 
-    paths = real_layer_paths(args.real_layer, args.kind) if args.real_layer is not None else {}
+    paths = ({} if args.real_layer is None
+             else weights.layer_paths(args.real_layer, args.kind))
     build_kwargs, spec_kwargs = {}, {}
     if args.kind == "gdn":
         build_kwargs["head_tile"] = args.head_tile

@@ -134,6 +134,28 @@ def default_path(layer: int, quantized: bool = False, mixer: str = "linear_attn"
     return root / "build_output" / "qwen3_8_27b" / f"{_STEMS[mixer]}_layer{layer}{suffix}.pt"
 
 
+def layer_paths(layer: int, kind: str, root: str | None = None) -> dict[str, str]:
+    """The three dumps one real decoder layer needs, keyed as a layer entry takes them.
+
+    *kind* is "gdn" for a linear-attention layer and "attn" for full attention; *root*
+    overrides the directory, for a dump set that does not sit where `--fetch` writes.
+    Both layer entries read their real weights through here: this file owns the names
+    `--fetch` writes, and the two entries must not import each other.
+    """
+    groups = {"weights": "linear_attn" if kind == "gdn" else "self_attn",
+              "mlp_weights": "mlp", "norm_weights": "norms"}
+    out = {}
+    for key, group in groups.items():
+        path = default_path(layer, mixer=group)
+        if root is not None:
+            path = Path(root) / path.name
+        if not path.is_file():
+            raise SystemExit(f"[weights] {path} is not on disk; fetch it with\n"
+                             f"  python weights.py --fetch --layer {layer} --mixer {group}")
+        out[key] = str(path)
+    return out
+
+
 def default_checkpoint_path() -> Path:
     """Default local directory for the pinned Eco-Tech checkpoint."""
     root = Path(__file__).resolve().parents[2]

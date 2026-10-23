@@ -260,26 +260,6 @@ def build_tensor_specs(kind: str, t: int = BENCH_SEQ, weights: str | None = None
     ])
 
 
-def real_layer_paths(layer: int, kind: str, root: str | None = None) -> dict:
-    """The three dumps one real layer needs, by the names `weights.py --fetch` writes."""
-    import pathlib
-
-    import weights
-
-    groups = {"weights": "linear_attn" if kind == "gdn" else "self_attn",
-              "mlp_weights": "mlp", "norm_weights": "norms"}
-    out = {}
-    for key, group in groups.items():
-        path = weights.default_path(layer, mixer=group)
-        if root is not None:
-            path = pathlib.Path(root) / path.name
-        if not path.is_file():
-            raise SystemExit(f"[prefill_layer] {path} is not on disk; fetch it with\n"
-                             f"  python weights.py --fetch --layer {layer} --mixer {group}")
-        out[key] = str(path)
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Oracles and acceptance
 # ---------------------------------------------------------------------------
@@ -422,14 +402,14 @@ def compare_fns() -> dict:
 
 __all__ = ["BENCH_SEQ", "DEFAULT_CASES", "KINDS", "LAYER_RING_HEAP",
            "build_attn_kernel", "build_gdn_kernel", "build_kernel", "build_tensor_specs",
-           "compare_fns", "golden_prefill_layer", "mixer_oracle", "real_layer_paths",
-           "run_config"]
+           "compare_fns", "golden_prefill_layer", "mixer_oracle", "run_config"]
 
 
 if __name__ == "__main__":
     import argparse
     import os
 
+    import weights
     from golden import run
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -473,7 +453,7 @@ if __name__ == "__main__":
 
     for kind, t in plan:
         paths = ({} if args.layer is None
-                 else real_layer_paths(args.layer, kind, args.weights_dir))
+                 else weights.layer_paths(args.layer, kind, args.weights_dir))
         print(f"[case] prefill_layer {kind} T={t}", flush=True)
         result = run(
             fn=build_kernel(kind, t=t),
