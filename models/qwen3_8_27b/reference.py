@@ -150,7 +150,7 @@ def _run_stage(st: dict, stage: str, chunk: int, narrow: bool) -> None:
         put("u", u)
     elif stage == "chunk_h":
         state, v_new, final_state = chunk_h_ref(st["k"], src("w"), src("u"),
-                                            st["g_sum"], chunk)
+                                            st["g_sum"], chunk, st.get("initial_state"))
         put("state", state)
         put("v_new", v_new)
         st["final_state"] = final_state
@@ -161,13 +161,14 @@ def _run_stage(st: dict, stage: str, chunk: int, narrow: bool) -> None:
 
 def delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                beta: torch.Tensor, g: torch.Tensor, chunk: int,
-               narrow: bool = False) -> dict[str, torch.Tensor]:
+               narrow: bool = False,
+               initial_state: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     """All six stages on the given inputs; every intermediate, `o` the output.
 
     The block's core. Float64 throughout unless *narrow*, which narrows the
     stage boundaries exactly as :func:`compute` does.
     """
-    st = dict(q=q, k=k, v=v, beta=beta, g=g)
+    st = dict(q=q, k=k, v=v, beta=beta, g=g, initial_state=initial_state)
     for stage in _STAGES:
         _run_stage(st, stage, chunk, narrow)
     return st
@@ -349,7 +350,8 @@ def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return x.to(REF_DTYPE) @ weight.to(REF_DTYPE).t()
 
 
-def short_conv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def short_conv(x: torch.Tensor, weight: torch.Tensor,
+               initial_state: torch.Tensor | None = None) -> torch.Tensor:
     """Depthwise causal convolution over the token axis, then silu. [T, C] -> [T, C].
 
     `out[t, c] = sum_j w[c, j] * x[t - (K - 1) + j, c]`, taps before the start of
@@ -361,7 +363,9 @@ def short_conv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     k = weight.shape[-1]
     xf = x.to(REF_DTYPE)
     wf = weight.reshape(c, k).to(REF_DTYPE)
-    padded = torch.cat([torch.zeros(k - 1, c, dtype=REF_DTYPE), xf])
+    history = (torch.zeros(k - 1, c, dtype=REF_DTYPE) if initial_state is None
+               else initial_state.to(REF_DTYPE))
+    padded = torch.cat([history, xf])
     out = torch.zeros(t, c, dtype=REF_DTYPE)
     for j in range(k):
         out += padded[j : j + t] * wf[:, j]
@@ -440,7 +444,9 @@ def gated_rmsnorm(o: torch.Tensor, z: torch.Tensor, weight: torch.Tensor,
 
 
 def block(x: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config,
-          chunk: int, quant_x: bool = False, quant_y: bool = False
+          chunk: int, quant_x: bool = False, quant_y: bool = False,
+          conv_state: torch.Tensor | None = None,
+          state: torch.Tensor | None = None,
           ) -> dict[str, torch.Tensor]:
     """The whole block in float64, hidden states `[T, hidden]` to `out` of the same shape.
 
@@ -475,11 +481,16 @@ def block(x: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config,
     st["z"] = linear(xf, weight(w, "in_proj_z")).reshape(t, h, d)
     st["a_proj"] = linear(xf, weight(w, "in_proj_a"))
     st["b_proj"] = linear(xf, weight(w, "in_proj_b"))
-    st["qkv_conv"] = short_conv(st["qkv"], w["conv1d.weight"])
+    st["qkv_conv"] = short_conv(st["qkv"], w["conv1d.weight"], conv_state)
+    st["conv_state_out"] = torch.cat([
+        torch.zeros(cfg.linear_conv_kernel_dim - 1, cfg.qkv_width, dtype=REF_DTYPE)
+        if conv_state is None else conv_state.to(REF_DTYPE), st["qkv"]
+    ])[-(cfg.linear_conv_kernel_dim - 1):]
     q, k, v = torch.split(st["qkv_conv"], [key_width, key_width, h * d], dim=-1)
     q, k, beta, g = qk_norm_gate(q.reshape(t, hg, d), k.reshape(t, hg, d),
                                  st["a_proj"], st["b_proj"], w["A_log"], w["dt_bias"])
-    st.update(delta_rule(q, k, v.reshape(t, h, d), beta, g, chunk))
+    st.update(delta_rule(q, k, v.reshape(t, h, d), beta, g, chunk,
+                         initial_state=state))
     st["y"] = gated_rmsnorm(st["o"], st["z"], w["norm.weight"], cfg.rms_norm_eps)
     y = st["y"].reshape(t, h * d)
     if quant_y:
@@ -857,7 +868,9 @@ def attn_inputs(key: str, t: int, cfg: Qwen38Config, weights: str | None = None,
 
 
 def attn_w8a8(x: torch.Tensor, w: dict[str, torch.Tensor], cos: torch.Tensor, sin: torch.Tensor,
-              cfg: Qwen38Config) -> torch.Tensor:
+              cfg: Qwen38Config, prefix_k: torch.Tensor | None = None,
+              prefix_v: torch.Tensor | None = None,
+              return_cache: bool = False):
     """The gated-attention mixer as the kernels compute it: int8 both sides, float64 between.
 
     The fake-quant reference, not the truth. Every hand-off the kernels make
@@ -872,14 +885,22 @@ def attn_w8a8(x: torch.Tensor, w: dict[str, torch.Tensor], cos: torch.Tensor, si
     k = (xf @ dequantize(w["w_k"], w["w_k_scale"]).t()).to(MODEL_DTYPE)
     v = (xf @ dequantize(w["w_v"], w["w_v_scale"]).t()).to(MODEL_DTYPE)
     q_rot, k_rot = attn_qk_norm_rope(qg, k, w["q_norm_w"], w["k_norm_w"], cos, sin, h, hkv, d, cfg.rms_norm_eps)
-    attended = causal_gqa_attention(q_rot.to(MODEL_DTYPE), k_rot.to(MODEL_DTYPE), v, h, hkv, d).to(MODEL_DTYPE)
+    k_attn = k_rot.to(MODEL_DTYPE)
+    v_attn = v
+    if prefix_k is not None:
+        k_attn = torch.cat([prefix_k, k_attn])
+        v_attn = torch.cat([prefix_v, v_attn])
+    attended = causal_gqa_attention(q_rot.to(MODEL_DTYPE), k_attn, v_attn, h, hkv, d).to(MODEL_DTYPE)
     act_q, act_scale = quantize_rows(attn_gate(attended, qg, h, d))
     out = dequantize(act_q, act_scale) @ dequantize(w["w_o"], w["w_o_scale"]).t()
-    return out.to(MODEL_DTYPE).to(REF_DTYPE)
+    result = out.to(MODEL_DTYPE).to(REF_DTYPE)
+    return (result, k_rot.to(MODEL_DTYPE), v) if return_cache else result
 
 
 def attn_truth(x: torch.Tensor, w: dict[str, torch.Tensor], cos: torch.Tensor, sin: torch.Tensor,
-               cfg: Qwen38Config) -> torch.Tensor:
+               cfg: Qwen38Config, prefix_k: torch.Tensor | None = None,
+               prefix_v: torch.Tensor | None = None,
+               return_cache: bool = False):
     """The same mixer in float64 throughout: the weights as stored, nothing else quantised.
 
     Isolates what the activation path costs -- the two per-token quantisers
@@ -892,8 +913,13 @@ def attn_truth(x: torch.Tensor, w: dict[str, torch.Tensor], cos: torch.Tensor, s
     k = xf @ dequantize(w["w_k"], w["w_k_scale"]).t()
     v = xf @ dequantize(w["w_v"], w["w_v_scale"]).t()
     q_rot, k_rot = attn_qk_norm_rope(qg, k, w["q_norm_w"], w["k_norm_w"], cos, sin, h, hkv, d, cfg.rms_norm_eps)
+    k_current, v_current = k_rot, v
+    if prefix_k is not None:
+        k_rot = torch.cat([prefix_k, k_rot])
+        v = torch.cat([prefix_v, v])
     attended = causal_gqa_attention(q_rot, k_rot, v, h, hkv, d)
-    return attn_gate(attended, qg, h, d) @ dequantize(w["w_o"], w["w_o_scale"]).t()
+    result = attn_gate(attended, qg, h, d) @ dequantize(w["w_o"], w["w_o_scale"]).t()
+    return (result, k_current, v_current) if return_cache else result
 
 
 ATTN_BAND = 1024        # query rows per band of the causal attention below
@@ -905,26 +931,52 @@ def causal_gqa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     """Causal grouped-query attention on flat `[T, H * D]` operands, in float64.
 
     The kernels' layout: `q` is `[T, heads * head_dim]`, `k` and `v` are
-    `[T, kv_heads * head_dim]`, and query head `h` reads KV head
+    `[prefix + T, kv_heads * head_dim]`, and query head `h` reads KV head
     `h // (heads // kv_heads)`. Returns `[T, heads * head_dim]`.
 
     Banded over query rows, and each band stops at its last key: the whole
     score tensor is 12.9 GB at T = 8192 in float64, and half of it is masked.
     """
     t = q.shape[0]
+    kv_t = k.shape[0]
+    prefix = kv_t - t
+    if prefix < 0 or v.shape[0] != kv_t:
+        raise ValueError("K/V must contain the query chunk and any cached prefix")
     group = heads // kv_heads
     qh = q.to(REF_DTYPE).reshape(t, heads, head_dim).transpose(0, 1)
-    kh = k.to(REF_DTYPE).reshape(t, kv_heads, head_dim).transpose(0, 1)
-    vh = v.to(REF_DTYPE).reshape(t, kv_heads, head_dim).transpose(0, 1)
+    kh = k.to(REF_DTYPE).reshape(kv_t, kv_heads, head_dim).transpose(0, 1)
+    vh = v.to(REF_DTYPE).reshape(kv_t, kv_heads, head_dim).transpose(0, 1)
     out = torch.empty(heads, t, head_dim, dtype=REF_DTYPE)
     for r0 in range(0, t, ATTN_BAND):
         r1 = min(r0 + ATTN_BAND, t)
-        causal = torch.arange(r1)[None, :] > torch.arange(r0, r1)[:, None]
+        k1 = prefix + r1
+        causal = torch.arange(k1)[None, :] > (prefix + torch.arange(r0, r1)[:, None])
         for h in range(heads):
-            scores = (qh[h, r0:r1] @ kh[h // group, :r1].t()) * scale
+            scores = (qh[h, r0:r1] @ kh[h // group, :k1].t()) * scale
             probs = torch.softmax(scores.masked_fill(causal, -torch.inf), dim=-1)
-            out[h, r0:r1] = probs @ vh[h // group, :r1]
+            out[h, r0:r1] = probs @ vh[h // group, :k1]
     return out.transpose(0, 1).reshape(t, heads * head_dim)
+
+
+def kv_page_rows(block_table: torch.Tensor, seq: int, length: int,
+                 page_size: int) -> torch.Tensor:
+    """The physical rows holding sequence `seq`'s first `length` cached tokens, in order.
+
+    The paged cache's index arithmetic, in one place: logical page `p` starts at
+    `block_table[seq, p] * page_size`, and the last page carries only the tokens the
+    length leaves in it. Every reader and writer of the cache derives its rows from
+    here, so a block-table or page-size disagreement between them cannot exist.
+    """
+    pages = (length + page_size - 1) // page_size
+    if pages > block_table.shape[1]:
+        raise ValueError(f"sequence {seq} at length {length} needs {pages} pages, "
+                         f"past the block table's {block_table.shape[1]}")
+    rows = []
+    for p in range(pages):
+        lo = int(block_table[seq, p]) * page_size
+        take = min(page_size, length - p * page_size)
+        rows.append(torch.arange(lo, lo + take))
+    return torch.cat(rows)
 
 
 def decode_gqa_attention(q: torch.Tensor, k_pages: torch.Tensor, v_pages: torch.Tensor,
@@ -953,14 +1005,7 @@ def decode_gqa_attention(q: torch.Tensor, k_pages: torch.Tensor, v_pages: torch.
     out = torch.zeros(b, heads, head_dim, dtype=REF_DTYPE)
     for i in range(b):
         length = int(seq_lens[i])
-        pages = (length + page_size - 1) // page_size
-        rows = []
-        for p in range(pages):
-            phys = int(block_table[i, p])
-            lo = phys * page_size
-            take = min(page_size, length - p * page_size)
-            rows.append(torch.arange(lo, lo + take))
-        idx = torch.cat(rows)
+        idx = kv_page_rows(block_table, i, length, page_size)
         kh = k_pages[idx].to(REF_DTYPE).reshape(length, kv_heads, head_dim)
         vh = v_pages[idx].to(REF_DTYPE).reshape(length, kv_heads, head_dim)
         for h in range(heads):
@@ -1018,6 +1063,29 @@ def append_kv_pages(k_pages: torch.Tensor, v_pages: torch.Tensor,
         row = int(block_table[i, page]) * page_size + offset
         k_pages[row] = k_new[i].to(k_pages.dtype)
         v_pages[row] = v_new[i].to(v_pages.dtype)
+
+
+def write_kv_pages(k_pages: torch.Tensor, v_pages: torch.Tensor, block_table: torch.Tensor,
+                   k_new: torch.Tensor, v_new: torch.Tensor, start_pos: int,
+                   page_size: int, seq: int = 0) -> None:
+    """Write a prefill chunk's K and V into one sequence's pages, in place.
+
+    The prefill counterpart of :func:`append_kv_pages`: that one places a single token
+    per sequence, this one places `k_new.shape[0]` consecutive tokens of one sequence,
+    beginning at absolute position `start_pos`. The rows come from
+    :func:`kv_page_rows`, so this writes exactly where :func:`decode_gqa_attention`
+    will read -- which is the whole correctness content of the prefill cache write.
+
+    `start_pos` must be page-aligned. The runner's packing pads every row to a multiple
+    of 256 tokens and the page is 128, so a chunk boundary is page-aligned by contract;
+    an unaligned one would split the first page between two writers.
+    """
+    tokens = k_new.shape[0]
+    if start_pos % page_size:
+        raise ValueError(f"start_pos {start_pos} is not a multiple of the page {page_size}")
+    rows = kv_page_rows(block_table, seq, start_pos + tokens, page_size)[start_pos:]
+    k_pages[rows] = k_new.to(k_pages.dtype)
+    v_pages[rows] = v_new.to(v_pages.dtype)
 
 
 def gated_attention(x: torch.Tensor, w: dict[str, torch.Tensor], cfg: Qwen38Config,

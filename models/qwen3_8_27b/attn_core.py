@@ -24,24 +24,31 @@ two in a two-entry queue.
 A step serves `PAIR` adjacent query blocks from one K and one V tile. Their rows
 are contiguous, so the cube runs one `PAIR_ROWS`-row matmul rather than `PAIR`
 of `ROW_TILE`, and the vector side keeps a separate accumulator per block.
+
+`row_base[i]` is the packed start of the row token `i` belongs to, so several
+sequences share one buffer and a query attends only to keys in its own row. Row
+starts are multiples of `KV_TILE`; an all-zero table is one sequence.
 """
 
 import pypto.language as pl
 
-from config import QWEN3_8_27B
+from config import KV_PAGE_SIZE, QWEN3_8_27B
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")                 # tokens
+K_DYN = pl.dynamic("K_DYN")                 # cached prefix plus current tokens
+ROW_DYN = pl.dynamic("ATTN_ROW_DYN")       # packed cache-owner rows
 
 # model config
 HQ = QWEN3_8_27B.num_attention_heads    # query heads
 HKV = QWEN3_8_27B.num_key_value_heads   # KV heads
 D = QWEN3_8_27B.head_dim                # head dimension
 # validation
-# one KV step, then two. The simulators run a step as one task and declare a
-# stall after 20 s without progress, which T = 8192 reaches long before the
-# kernel finishes; the prefill shape comes from --seq-len.
-DEFAULT_CASES = (256, 512)
+# `(tokens, rows)`: one KV step, then two, then two unequal rows in one buffer.
+# The simulators run a step as one task and declare a stall after 20 s without
+# progress, which T = 8192 reaches long before the kernel finishes; the prefill
+# shape comes from --seq-len.
+DEFAULT_CASES = ((256, 1), (512, 1), (768, 2))
 BENCH_SEQ = 8192        # prefill tokens, selected explicitly with --seq-len
 
 # a5sim cannot compile the cross-core wait (pto-isa#612), so --platform a5 compiles only.
@@ -119,19 +126,65 @@ def causal_bias(row_tile: int = ROW_TILE, kv_tile: int = KV_TILE):
     return torch.where(open_, 0.0, MASK_NEG).to(torch.float32)
 
 
+def row_starts(t: int, rows: int = 1) -> list:
+    """The packed start of each of `rows` rows tiling `t` tokens, each a multiple of KV_TILE.
+
+    The first `rows - 1` rows take one KV tile and the last takes the rest, so a packed
+    case has rows of unequal length and a last row that spans several KV tiles.
+    """
+    tiles = t // KV_TILE
+    if t % KV_TILE or rows < 1 or rows > tiles:
+        raise ValueError(f"{rows} rows need t a multiple of KV_TILE={KV_TILE} and at least "
+                         f"{rows * KV_TILE} tokens; got t={t}")
+    starts, tile = [], 0
+    for size in [1] * (rows - 1) + [tiles - (rows - 1)]:
+        starts.append(tile * KV_TILE)
+        tile += size
+    return starts
+
+
+def row_base_table(t: int, rows: int = 1):
+    """`[t]` INT32: the packed start of the row each token belongs to."""
+    import torch
+
+    starts = row_starts(t, rows)
+    spans = [end - start for start, end in zip(starts, starts[1:] + [t])]
+    pieces = [torch.full((span,), start, dtype=torch.int32) for start, span in zip(starts, spans)]
+    return torch.cat(pieces)
+
+
+def row_owner_table(t: int, rows: int = 1):
+    """`[t]` INT32: the block-table and scratch-band owner for each token."""
+    import torch
+
+    starts = row_starts(t, rows)
+    ends = starts[1:] + [t]
+    return torch.cat([
+        torch.full((end - start,), owner, dtype=torch.int32)
+        for owner, (start, end) in enumerate(zip(starts, ends))
+    ])
+
+
 def _qwen3_attn_core(
     q: pl.Tensor[[T_DYN, Q_WIDTH], pl.BF16],
-    k: pl.Tensor[[T_DYN, KV_WIDTH], pl.BF16],
-    v: pl.Tensor[[T_DYN, KV_WIDTH], pl.BF16],
+    k: pl.Tensor[[K_DYN, KV_WIDTH], pl.BF16],
+    v: pl.Tensor[[K_DYN, KV_WIDTH], pl.BF16],
     mask_bias: pl.Tensor[[ROW_TILE, BIAS_WIDTH], pl.FP32],
+    row_base: pl.Tensor[[T_DYN], pl.INT32],
+    row_owner: pl.Tensor[[T_DYN], pl.INT32],
+    page_bases: pl.Tensor[[ROW_DYN], pl.INT32],
     out: pl.Out[pl.Tensor[[T_DYN, Q_WIDTH], pl.BF16]],
 ):
-    """The token count must be a multiple of KV_TILE; a step walks one whole tile."""
+    """Every row and the cached prefix must be KV_TILE aligned; a step walks one whole tile."""
     q.bind_dynamic(0, T_DYN)
-    k.bind_dynamic(0, T_DYN)
-    v.bind_dynamic(0, T_DYN)
+    k.bind_dynamic(0, K_DYN)
+    v.bind_dynamic(0, K_DYN)
+    row_base.bind_dynamic(0, T_DYN)
+    row_owner.bind_dynamic(0, T_DYN)
+    page_bases.bind_dynamic(0, ROW_DYN)
     out.bind_dynamic(0, T_DYN)
     t_dim = pl.tensor.dim(q, 0)
+    key_stride = pl.tensor.dim(k, 0) // pl.tensor.dim(page_bases, 0)
     # GM mailboxes: one disjoint slot ring per query head, so no two cores
     # and no two steps in flight share rows. A slot holds the pair's rows.
     score_mb = pl.create_tensor([MAILBOX_ROWS, KV_TILE], dtype=pl.FP32)
@@ -148,12 +201,20 @@ def _qwen3_attn_core(
         for qp in pl.range(t_dim // PAIR_ROWS):
             r0 = qp * PAIR_ROWS
             r1 = r0 + ROW_TILE
+            # This pair's row starts at `base`, and the keys before it belong to
+            # another sequence. Row starts are multiples of KV_TILE, so `r0 - base`
+            # stays on the pair grid and the mask is read at the same columns.
+            base = pl.cast(pl.read(row_base, [r0]), pl.INDEX)
+            owner = pl.cast(pl.read(row_owner, [r0]), pl.INDEX)
+            prefix = pl.cast(pl.read(page_bases, [owner]), pl.INDEX) * KV_PAGE_SIZE
+            key_base = owner * key_stride
             # The diagonal tile is the last step, and the only masked one. Both
             # blocks of the pair share it, RATIO being a multiple of PAIR.
-            n_below = (qp * PAIR) // RATIO
+            position = prefix + r0 - base
+            n_below = position // KV_TILE
             n_kv = n_below + 1
             c_diag = n_below * KV_TILE
-            bias_c0 = KV_TILE - ROW_TILE - (r0 - c_diag)
+            bias_c0 = KV_TILE - ROW_TILE - (position - c_diag)
             bias_c1 = bias_c0 - ROW_TILE
 
             # ---- cube: QK for step `tick`, PV for step `tick - PRE_LAUNCH`
@@ -161,7 +222,7 @@ def _qwen3_attn_core(
             for tick in pl.range(n_kv + PRE_LAUNCH):
                 if tick < n_kv:
                     qk_row = head_row + (tick % SLOTS) * PAIR_ROWS
-                    k_tile = pl.load(k, [tick * KV_TILE, kd0], [KV_TILE, D],
+                    k_tile = pl.load(k, [key_base + tick * KV_TILE, kd0], [KV_TILE, D],
                                      target_memory=pl.MemorySpace.Mat)
                     scores = pl.matmul(q_pair, pl.tile.transpose_view(k_tile), out_dtype=pl.FP32)
                     pl.store(scores, [qk_row, 0], score_mb)
@@ -171,7 +232,7 @@ def _qwen3_attn_core(
                     step = tick - PRE_LAUNCH
                     pv_row = head_row + (step % SLOTS) * PAIR_ROWS
                     # V does not depend on the softmax, so its load overlaps it.
-                    v_tile = pl.load(v, [step * KV_TILE, kd0], [KV_TILE, D],
+                    v_tile = pl.load(v, [key_base + step * KV_TILE, kd0], [KV_TILE, D],
                                      target_memory=pl.MemorySpace.Mat)
                     pl.system.sync_wait(PROB_READY, pipe=pl.PipeType.MTE2,
                                         core_type=pl.KernelType.AIC)
@@ -286,10 +347,19 @@ qwen3_attn_core_test = pl.jit(auto_scope=False)(_qwen3_attn_core)
 SCORE_STD = 4.0
 
 
-def build_tensor_specs(t: int = BENCH_SEQ, hq: int = HQ, hkv: int = HKV, d: int = D,
-                       row_tile: int = ROW_TILE, kv_tile: int = KV_TILE):
+def build_tensor_specs(t: int = BENCH_SEQ, rows: int = 1, hq: int = HQ, hkv: int = HKV,
+                       d: int = D, row_tile: int = ROW_TILE, kv_tile: int = KV_TILE,
+                       prefix_tiles: int = 0, row_prefix_tiles: tuple[int, ...] | None = None):
     import torch
     from golden import TensorSpec
+
+    starts = row_starts(t, rows)
+    largest = max(end - start for start, end in zip(starts, starts[1:] + [t]))
+    prefixes = row_prefix_tiles if row_prefix_tiles is not None else (prefix_tiles,) * rows
+    if len(prefixes) != rows or any(p < 0 for p in prefixes):
+        raise ValueError("row_prefix_tiles must contain one nonnegative value per row")
+    key_stride = max(prefixes) * kv_tile + largest
+    total = rows * key_stride
 
     def draw(seed, cols, scale):
         def make():
@@ -299,10 +369,20 @@ def build_tensor_specs(t: int = BENCH_SEQ, hq: int = HQ, hkv: int = HKV, d: int 
 
     return [
         TensorSpec("q", [t, hq * d], torch.bfloat16, init_value=draw(42, hq * d, SCORE_STD * d ** -0.5)),
-        TensorSpec("k", [t, hkv * d], torch.bfloat16, init_value=draw(43, hkv * d, 1.0)),
-        TensorSpec("v", [t, hkv * d], torch.bfloat16, init_value=draw(44, hkv * d, 1.0)),
+        TensorSpec("k", [total, hkv * d], torch.bfloat16,
+                   init_value=lambda: (torch.randn(total, hkv * d,
+                                                   generator=torch.Generator().manual_seed(43))).to(torch.bfloat16)),
+        TensorSpec("v", [total, hkv * d], torch.bfloat16,
+                   init_value=lambda: (torch.randn(total, hkv * d,
+                                                   generator=torch.Generator().manual_seed(44))).to(torch.bfloat16)),
         TensorSpec("mask_bias", [row_tile, 2 * kv_tile - row_tile], torch.float32,
                    init_value=lambda: causal_bias(row_tile, kv_tile)),
+        TensorSpec("row_base", [t], torch.int32, init_value=lambda: row_base_table(t, rows)),
+        TensorSpec("row_owner", [t], torch.int32,
+                   init_value=lambda: row_owner_table(t, rows)),
+        TensorSpec("page_bases", [rows], torch.int32,
+                   init_value=lambda: torch.tensor(
+                       [p * kv_tile // KV_PAGE_SIZE for p in prefixes], dtype=torch.int32)),
         TensorSpec("out", [t, hq * d], torch.bfloat16),
     ]
 
@@ -334,8 +414,17 @@ def golden_qwen3_attn_core(tensors):
     q, k, v = tensors["q"], tensors["k"], tensors["v"]
     hkv = k.shape[1] // D
     hq = q.shape[1] // D
-    ref = reference.causal_gqa_attention(q, k, v, hq, hkv, D)
-    tensors["out"].copy_(ref.to(torch.bfloat16))
+    starts = sorted(set(tensors["row_base"].tolist()))
+    key_stride = k.shape[0] // tensors["page_bases"].shape[0]
+    for r0, r1 in zip(starts, starts[1:] + [q.shape[0]]):
+        owner = int(tensors["row_owner"][r0])
+        prefix = int(tensors["page_bases"][owner]) * KV_PAGE_SIZE
+        first = owner * key_stride
+        length = prefix + r1 - r0
+        q_full = torch.cat([torch.zeros(prefix, q.shape[1], dtype=q.dtype), q[r0:r1]])
+        ref = reference.causal_gqa_attention(q_full, k[first : first + length],
+                                             v[first : first + length], hq, hkv, D)
+        tensors["out"][r0:r1].copy_(ref[prefix:].to(torch.bfloat16))
 
 
 
@@ -350,24 +439,40 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=None,
                         help="one shape instead of DEFAULT_CASES")
+    parser.add_argument("--rows", type=int, default=1,
+                        help="sequences packed into the buffer, with --seq-len")
+    parser.add_argument("--prefix-tiles", type=int, default=0,
+                        help="cached 256-token tiles before this chunk, with --seq-len")
+    parser.add_argument("--row-prefix-tiles", type=str, default=None,
+                        help="comma-separated cached 256-token tiles for each packed row")
     parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
-    cases = [args.seq_len] if args.seq_len else list(DEFAULT_CASES)
+    cases = [(args.seq_len, args.rows, args.prefix_tiles)] if args.seq_len else [
+        (t, rows, 0) for t, rows in DEFAULT_CASES]
     if args.seq_len and args.seq_len % KV_TILE:
         parser.error(f"--seq-len must be a multiple of KV_TILE={KV_TILE}")
+    if args.row_prefix_tiles and not args.seq_len:
+        parser.error("--row-prefix-tiles requires --seq-len")
+    row_prefix_tiles = (None if args.row_prefix_tiles is None else
+                        tuple(int(value) for value in args.row_prefix_tiles.split(",")))
+    if row_prefix_tiles is not None and (len(row_prefix_tiles) != args.rows or
+                                         any(value < 0 for value in row_prefix_tiles)):
+        parser.error("--row-prefix-tiles needs one nonnegative value per row")
     if len(cases) > 1 and (args.golden_data or args.runtime_dir):
         parser.error("--golden-data and --runtime-dir carry one shape; name it with --seq-len")
     # a5sim cannot compile the cross-core wait (pto-isa#612).
     compile_only = args.compile_only or args.backend_type == "a5"
 
-    for t in cases:
-        print(f"[case] attn_core T={t}", flush=True)
+    for t, rows, prefix_tiles in cases:
+        print(f"[case] attn_core T={t} rows={rows} prefix_tiles={prefix_tiles} "
+              f"row_prefix_tiles={row_prefix_tiles}", flush=True)
         result = run(
             fn=qwen3_attn_core_test,
-            specs=build_tensor_specs(t=t),
+            specs=build_tensor_specs(t=t, rows=rows, prefix_tiles=prefix_tiles,
+                                     row_prefix_tiles=row_prefix_tiles),
             golden_fn=None if compile_only else golden_qwen3_attn_core,
             compare_fn=None if compile_only else {"out": compare_out},
             golden_data=args.golden_data,
@@ -385,4 +490,4 @@ if __name__ == "__main__":
         if not result.passed:
             if result.error:
                 print(result.error)
-            raise SystemExit(f"FAILED at T={t}")
+            raise SystemExit(f"FAILED at T={t} rows={rows}")

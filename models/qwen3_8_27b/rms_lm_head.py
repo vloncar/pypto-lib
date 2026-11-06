@@ -6,30 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Qwen3.8-27B final RMSNorm and LM head: `logits = norm(hidden) @ lm_w^T`.
-
-Takes the rows logits are wanted for, not the whole sequence. The norm is the
-zero-centred `1 + w` of `rmsnorm.py`, fused here so the normed rows stay on chip
-between the two halves. `lm_w` is BF16, so this projection is not W8A8.
-
-The L1 Mat buffer bounds `vocab_tile` and `lm_k_tile` **together**, not separately:
-the K pipeline double-buffers both operands, so
-`(row_tile + vocab_tile) * lm_k_tile * 2 bytes * 2` must fit 524288, which is
-`(row_tile + vocab_tile) * lm_k_tile <= 131072`. A smaller contraction step buys a
-wider vocabulary tile.
-
-**The tiles below are right and the sweep that checked them found nothing.** 2425 MiB of
-BF16 weight is a long enough stream to amortise everything, and at 16 rows this reaches
-**98.2% of the box's vector copy roof** -- 2098.9 us, 1211.5 GB/s, the highest fraction
-measured anywhere in this model. Over 18 legal `(vocab_tile, lm_k_tile)` pairs the spread
-is 1.32x and the best, `vocab_tile = 128`, is **0.6% ahead**; at 32 rows the best is
-`vocab_tile = 256 lm_k_tile = 256`, 1.6% ahead. Neither is worth a batch-dependent
-constant. `lm_cores = 24` is one wave of the cube, which G5.14 found is what a projection
-wants.
-
-So the only lever left on this operator is the weight itself: it is the one projection in
-the model still BF16, and 2425 MiB is 9.4% of what a decode token streams.
-"""
+"""Qwen3.8-27B final RMSNorm and BF16 LM head over selected residual-stream rows."""
 import pypto.language as pl
 
 from config import QWEN3_8_27B
@@ -76,9 +53,9 @@ def build_kernel(row_tile: int = ROW_TILE, rms_k_tile: int = RMS_K_TILE,
     **The row extent is padded; `valid_rows` says how many of them are real.** Without that
     split the ordinary case could not call this kernel at all: one sequence is one row, and
     every loop here steps a whole `row_tile` of 16, so a one-row tensor gave `pl.range` zero
-    iterations and returned with `logits` untouched -- no error, no output (G3.6).
+    iterations and returned with `logits` untouched -- no error, no output.
 
-    So `hidden_states` and `logits` carry a row extent that is a multiple of `row_tile`, the
+    So the inputs and `logits` carry a row extent that is a multiple of `row_tile`, the
     loops cover all of it, and only the store is trimmed, with `pl.tensor.set_validshape`.
     The padded rows are normed and projected and then not written, which costs at most one
     tile of arithmetic and keeps every read inside the tensor. `qwen3_14b/rms_lm_head.py`
@@ -87,24 +64,26 @@ def build_kernel(row_tile: int = ROW_TILE, rms_k_tile: int = RMS_K_TILE,
 
     @(pl.jit.inline if inline else pl.jit)
     def _qwen3_rms_lm_head(
-        hidden_states: pl.Tensor[[ROWS_DYN, HIDDEN], pl.BF16],
+        residual: pl.Tensor[[ROWS_DYN, HIDDEN], pl.FP32],
+        delta: pl.Tensor[[ROWS_DYN, HIDDEN], pl.BF16],
         norm_w: pl.Tensor[[HIDDEN], pl.BF16],
         lm_w: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
         logits: pl.Out[pl.Tensor[[ROWS_DYN, VOCAB], pl.FP32]],
         valid_rows: pl.Scalar[pl.INDEX],
     ):
         """The row extent must be a multiple of row_tile; `valid_rows` may be anything."""
-        hidden_states.bind_dynamic(0, ROWS_DYN)
+        residual.bind_dynamic(0, ROWS_DYN)
+        delta.bind_dynamic(0, ROWS_DYN)
         logits.bind_dynamic(0, ROWS_DYN)
-        row_dim = pl.tensor.dim(hidden_states, 0)
+        row_dim = pl.tensor.dim(residual, 0)
         w_row = pl.reshape(norm_w[:], [1, HIDDEN])
         normed = pl.create_tensor([row_dim, HIDDEN], dtype=pl.BF16)
         for r0 in pl.parallel(0, row_dim, row_tile):
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="final_rmsnorm"):
                 partial_sq = pl.full([1, row_tile], dtype=pl.FP32, value=0.0)
                 for k0 in pl.range(0, HIDDEN, rms_k_tile):
-                    sq_x = pl.cast(hidden_states[r0 : r0 + row_tile, k0 : k0 + rms_k_tile],
-                                   target_type=pl.FP32)
+                    sq_d = pl.cast(delta[r0 : r0 + row_tile, k0 : k0 + rms_k_tile], target_type=pl.FP32)
+                    sq_x = pl.add(residual[r0 : r0 + row_tile, k0 : k0 + rms_k_tile], sq_d)
                     sq_prod = pl.mul(sq_x, sq_x)
                     sq_row = pl.reshape(pl.row_sum(sq_prod), [1, row_tile])
                     partial_sq = pl.add(partial_sq, sq_row)
@@ -113,8 +92,8 @@ def build_kernel(row_tile: int = ROW_TILE, rms_k_tile: int = RMS_K_TILE,
                 inv_rms = pl.rsqrt(pl.add(variance, EPS), high_precision=True)
 
                 for k0 in pl.range(0, HIDDEN, rms_k_tile):
-                    norm_x = pl.cast(hidden_states[r0 : r0 + row_tile, k0 : k0 + rms_k_tile],
-                                     target_type=pl.FP32)
+                    norm_d = pl.cast(delta[r0 : r0 + row_tile, k0 : k0 + rms_k_tile], target_type=pl.FP32)
+                    norm_x = pl.add(residual[r0 : r0 + row_tile, k0 : k0 + rms_k_tile], norm_d)
                     w_tile = pl.cast(w_row[:, k0 : k0 + rms_k_tile], target_type=pl.FP32)
                     gamma = pl.add(w_tile, 1.0)
                     scaled = pl.row_expand_mul(norm_x, inv_rms)
@@ -141,6 +120,25 @@ def build_kernel(row_tile: int = ROW_TILE, rms_k_tile: int = RMS_K_TILE,
 
     return _qwen3_rms_lm_head
 
+
+def build_l3_kernel(batch: int):
+    """Build a HOST entry for a fixed token-row extent."""
+    if batch < ROW_TILE or batch % ROW_TILE:
+        raise ValueError("LM head rows must be a positive multiple of ROW_TILE")
+    kernel = build_kernel()
+
+    @pl.jit.host
+    def l3_rms_lm_head(
+        residual: pl.Tensor[[batch, HIDDEN], pl.FP32],
+        delta: pl.Tensor[[batch, HIDDEN], pl.BF16],
+        norm_w: pl.Tensor[[HIDDEN], pl.BF16],
+        lm_w: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+        logits: pl.Out[pl.Tensor[[batch, VOCAB], pl.FP32]],
+        valid_rows: pl.Scalar[pl.INDEX],
+    ):
+        return kernel(residual, delta, norm_w, lm_w, logits, valid_rows)
+
+    return l3_rms_lm_head
 
 qwen3_rms_lm_head = build_kernel(inline=True)
 qwen3_rms_lm_head_test = build_kernel()
@@ -176,17 +174,19 @@ def build_tensor_specs(rows: int = ROWS, hidden: int = HIDDEN, vocab: int = VOCA
                        row_tile: int = ROW_TILE):
     """Fixtures for `rows` real rows, in a tensor padded up to `row_tile`.
 
-    The padding rows are drawn like the rest rather than zeroed: a zero row has zero
-    variance, so it would normalise to whatever `EPS` allows and could not distinguish a
-    kernel that trims its store from one that writes garbage into the tail.
+    Padding inputs are populated; logits beyond `valid_rows` are undefined.
     """
     import torch
     from golden import ScalarSpec, TensorSpec
 
     padded = padded_rows(rows, row_tile)
 
-    def init_hidden():
+    def init_residual():
         gen = torch.Generator().manual_seed(42)
+        return torch.randn(padded, hidden, generator=gen)
+
+    def init_delta():
+        gen = torch.Generator().manual_seed(45)
         return torch.randn(padded, hidden, generator=gen).to(torch.bfloat16)
 
     def init_norm_w():
@@ -197,7 +197,8 @@ def build_tensor_specs(rows: int = ROWS, hidden: int = HIDDEN, vocab: int = VOCA
         return _banded_normal(vocab, hidden, seed=44, scale=hidden ** -0.5)
 
     return [
-        TensorSpec("hidden_states", [padded, hidden], torch.bfloat16, init_value=init_hidden),
+        TensorSpec("residual", [padded, hidden], torch.float32, init_value=init_residual),
+        TensorSpec("delta", [padded, hidden], torch.bfloat16, init_value=init_delta),
         TensorSpec("norm_w", [hidden], torch.bfloat16, init_value=init_norm_w),
         TensorSpec("lm_w", [vocab, hidden], torch.bfloat16, init_value=init_lm_w),
         TensorSpec("logits", [padded, vocab], torch.float32),
@@ -222,11 +223,11 @@ def golden_qwen3_rms_lm_head(eps: float = EPS):
         # The kernel narrows the normed rows to BF16 before the head, as the
         # module does; leaving them in float64 would score the dtype rather
         # than the kernel.
-        # Only the valid rows, matching the kernel's trimmed store: the padded tail is
-        # normed and projected on device and then not written, so scoring it would compare
-        # this oracle against whatever `logits` was initialised to.
+        # The oracle and comparison cover only the written prefix of logits.
         rows = tensors["valid_rows"]
-        normed = reference.rmsnorm(tensors["hidden_states"][:rows], tensors["norm_w"], eps)
+        # The addition in fp32, as the kernel computes it, and the norm of that sum.
+        total = (tensors["residual"][:rows].double() + tensors["delta"][:rows].double()).float()
+        normed = reference.rmsnorm(total.double(), tensors["norm_w"], eps)
         normed_bf = normed.to(torch.bfloat16).to(reference.REF_DTYPE)
         lm_w, out = tensors["lm_w"], tensors["logits"]
         # Widen the weight one vocabulary band at a time. Whole, it is 9.47 GiB
@@ -248,9 +249,14 @@ FROB_GATE = 1e-4
 
 
 def compare_logits():
-    """Relative Frobenius against the float64 oracle, with the distribution reported."""
-    def compare(actual, expected, **_kwargs):
-        a, e = actual.double(), expected.double()
+    """Relative Frobenius on the valid logits against the float64 oracle."""
+    def compare(actual, expected, inputs=None, **_kwargs):
+        if inputs is None or "valid_rows" not in inputs:
+            return False, "logits: missing valid_rows input"
+        live = int(inputs["valid_rows"])
+        if not 0 < live <= min(actual.shape[0], expected.shape[0]):
+            return False, f"logits: invalid valid-row count {live}"
+        a, e = actual[:live].double(), expected[:live].double()
         frob = float((a - e).norm() / e.norm())
         diff = (a - e).abs()
         over = int((diff > 1e-4 + 1e-2 * e.abs()).sum())

@@ -191,10 +191,10 @@ def _parts(batch: int, norm_col_groups: int | None = NORM_COL_GROUPS,
 
 def build_gdn_kernel(batch: int, head_tile: int = decode_gdn_block.HEAD_TILE,
                      norm_col_groups: int | None = NORM_COL_GROUPS, mlp_fanned: bool = True,
-                     inline: bool = False):
+                     inline: bool = False, active_rows: int = 0):
     """A linear-attention layer: the Gated DeltaNet mixer between the two norms."""
     m, norm_in, norm_post, mlp = _parts(batch, norm_col_groups, mlp_fanned)
-    mixer = decode_gdn_block.build_kernel(m, head_tile=head_tile, inline=True)
+    mixer = decode_gdn_block.build_kernel(m, head_tile=head_tile, inline=True, active_rows=active_rows)
 
     @(pl.jit.inline if inline else pl.jit)
     def decode_gdn_layer(

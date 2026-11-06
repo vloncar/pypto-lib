@@ -128,9 +128,12 @@ def build_kernel(batch: int, inline: bool = False, tiles: dict | None = None,
     op_gate_up = gate_up_swiglu.build_kernel(m=batch, k=HIDDEN, n=INTER, inline=True,
                                              m_tile=batch, n_tile=up_n_tile, k_tile=up_k_tile,
                                              m_group=1, n_group=up_n_group)
-    op_down = a8w8_linear.build_kernel(m=batch, k=INTER, n=HIDDEN, name="down_proj", inline=True,
-                                       m_tile=batch, n_tile=down_n_tile, k_tile=down_k_tile,
-                                       m_group=1, n_group=down_n_group)
+    # Two GM transport slots for the 16-row down projection.
+    op_down = a8w8_linear.build_kernel(
+        m=batch, k=INTER, n=HIDDEN, name="down_proj", inline=True,
+        m_tile=batch, n_tile=down_n_tile, k_tile=down_k_tile,
+        m_group=1, n_group=down_n_group, ring_slots=2 if batch == 16 else 1,
+    )
 
     @(pl.jit.inline if inline else pl.jit)
     def qwen3_decode_mlp(

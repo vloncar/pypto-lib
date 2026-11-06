@@ -73,7 +73,7 @@ against the quantisation floor rather than in isolation.
 """
 import pypto.language as pl
 
-from config import QWEN3_8_27B
+from config import KV_PAGE_SIZE, QWEN3_8_27B
 
 # Dynamic shape variables.
 B_DYN = pl.dynamic("B_DYN")                     # decode sequences, one query row each
@@ -86,13 +86,13 @@ D = QWEN3_8_27B.head_dim                        # 256
 GROUP = HQ // HKV                               # query heads sharing one KV head
 Q_WIDTH = HQ * D
 KV_WIDTH = HKV * D
+PAGE = KV_PAGE_SIZE                             # rows per page, the cache's addressing unit
 
 # validation
 # one sequence, then the serving batch; a task is one sequence and KV head.
 DEFAULT_CASES = (1, 4)
 
 # tiling
-PAGE = 128              # KV page size; the serving layer's choice, not the kernel's
 SPLITS = 1              # page ranges per sequence; see the table above
 Q_PAD = 16              # the cube's M fractal: GROUP real rows live in a 16-row tile
 

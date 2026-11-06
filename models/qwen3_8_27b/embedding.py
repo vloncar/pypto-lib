@@ -6,13 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Qwen3.8-27B token embedding: `out[t, :] = embed_weight[input_ids[t], :]`.
-
-One row of the table per token, copied in `K_TILE`-wide pieces. The row index
-is a scalar read of the id cast to `pl.INDEX`, so the slice offset is dynamic;
-work is fanned over tokens times hidden blocks so a short sequence still fills
-the cores.
-"""
+"""Qwen3.8-27B token embedding: out[t, :] = embed_weight[input_ids[t], :]."""
 import pypto.language as pl
 
 from config import QWEN3_8_27B
@@ -66,6 +60,22 @@ def _qwen3_embedding(
 qwen3_embedding = pl.jit.inline(_qwen3_embedding)
 qwen3_embedding_test = pl.jit(_qwen3_embedding)
 
+
+def build_l3_kernel(batch: int):
+    """Build a HOST entry for a fixed token-row extent."""
+    if batch < 1:
+        raise ValueError("embedding requires at least one token")
+    kernel = qwen3_embedding_test
+
+    @pl.jit.host
+    def l3_embedding(
+        input_ids: pl.Tensor[[batch], pl.INT32],
+        embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+        out: pl.Out[pl.Tensor[[batch, HIDDEN], pl.BF16]],
+    ):
+        return kernel(input_ids, embed_weight, out)
+
+    return l3_embedding
 
 
 

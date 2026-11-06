@@ -131,12 +131,13 @@ def build_kernel(t: int = BENCH_SEQ, hidden: int = HIDDEN, inter: int = INTER,
     """
     up_m_group = _patch(t // UP_M_TILE, UP_M_PREFER)
     up_n_group = _patch(inter // UP_N_TILE, UP_N_PREFER)
-    down_m_group = _patch(t // DOWN_M_TILE, DOWN_M_PREFER)
+    # One M tile per patch at the 2048-token serving shape.
+    down_m_group = 1 if t == 2048 else _patch(t // DOWN_M_TILE, DOWN_M_PREFER)
     down_n_group = _patch(hidden // DOWN_N_TILE, DOWN_N_PREFER)
 
     op_gate = op_up = op_gate_up = None
     if fused:
-        fused_m_group = _patch(t // UP_M_TILE, FUSED_M_PREFER)
+        fused_m_group = 1 if t == 2048 else _patch(t // UP_M_TILE, FUSED_M_PREFER)
         fused_n_group = _patch(inter // UP_N_TILE, FUSED_N_PREFER)
         op_gate_up = gate_up_swiglu.build_kernel(m=t, k=hidden, n=inter, inline=True,
                                                  m_tile=UP_M_TILE, n_tile=UP_N_TILE,

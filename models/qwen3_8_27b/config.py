@@ -6,27 +6,20 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Qwen3.8-27B configuration, and the W8A8 scheme of its quantized checkpoint.
-
-Model values follow HuggingFace `config.json` and carry its field names, so a
-reader can check them against the published config without a translation table.
-They were read from `Qwen/Qwen3.8-27B` and from the safetensors headers of its
-first shard; the layer they describe is `model.language_model.layers.N.linear_attn`.
-
-Only the linear-attention block is implemented here. The gated-attention layers,
-the MoE-free dense MLP, the vision tower and the MTP layer are model fields for
-context, not things this tree builds.
-
-`Qwen38Dimensions` names the widths the whole-model kernels pass across their
-boundaries, each derived from one `Qwen38Config` so a reduced test config produces
-a consistent table.
-"""
+"""Qwen3.8-27B text-model dimensions, layer schedule and checkpoint quantization."""
 
 from dataclasses import dataclass
 
 
 LINEAR_ATTENTION = "linear_attention"
 FULL_ATTENTION = "full_attention"
+
+# The KV cache's page, in tokens. The serving layer's choice rather than a kernel tile,
+# and a boundary width like the ones `Qwen38Dimensions` carries: the prefill write, the
+# decode append and the decode attention all address the pool with it, and a
+# disagreement between them writes rows the reader skips with nothing in either
+# signature to notice.
+KV_PAGE_SIZE = 128
 
 
 @dataclass(frozen=True)

@@ -23,8 +23,8 @@ buffer.
 
 Qwen3.8-27B needs this for exactly one projection: the GDN block's `out_proj`,
 which Eco-Tech leaves in BF16 while quantizing every other linear in the
-layer. `contract.py` records that, and `GDN_STATE.md` records what quantizing
-it anyway would cost. Running this file exercises that shape.
+layer. `contract.py` records the checkpoint dtype. Running this file exercises
+that shape.
 """
 import pypto.language as pl
 
@@ -162,7 +162,7 @@ def build_specs(t: int = BENCH_SEQ, k: int = K, n: int = N, weights: str | None 
 
     The activation is drawn rather than taken from the block chain. This file
     measures and validates the projection itself; what the gated norm hands it
-    is `gdn_block`'s business, and `GDN_STATE.md` carries the composed pair.
+    is validated by the composed `gdn_block` entry.
     """
     import torch
     from golden import TensorSpec

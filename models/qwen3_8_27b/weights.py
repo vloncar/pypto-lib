@@ -116,8 +116,17 @@ class PreparedQwen38Weights:
 # The tensor groups one layer can be fetched in. `mlp` and `norms` are on every
 # layer; the two mixers are on the layers their type says.
 MIXERS = ("linear_attn", "self_attn", "mlp", "norms")
+TEXT_GROUP = "text"     # the three tensors that belong to no decoder layer
+FETCH_GROUPS = MIXERS + (TEXT_GROUP,)
+
+# The embedding table, the model's final norm and the LM head, keyed as
+# `prefill_text_fwd` takes them. The two vocabulary-sized ones are 2.37 GiB each and sit in
+# different shards, so this group is fetched by name rather than by layer prefix.
+TEXT_TENSORS = {"embed_weight": "model.language_model.embed_tokens.weight",
+                "final_norm_w": "model.language_model.norm.weight",
+                "lm_w": "lm_head.weight"}
 _STEMS = {"linear_attn": "linear_attn", "self_attn": "full_attn", "mlp": "mlp",
-          "norms": "norms"}
+          "norms": "norms", "text": "text"}
 
 # `norms` is the only group that is not a submodule: the two layer norms sit
 # directly under the layer, so they are named rather than taken by prefix.
@@ -132,6 +141,13 @@ def default_path(layer: int, quantized: bool = False, mixer: str = "linear_attn"
     root = Path(__file__).resolve().parents[2]
     suffix = "_int8" if quantized else ""
     return root / "build_output" / "qwen3_8_27b" / f"{_STEMS[mixer]}_layer{layer}{suffix}.pt"
+
+
+def text_path(root: str | None = None) -> Path:
+    """Path for the extracted non-layer tensors: the embedding, the final norm, the head."""
+    if root is not None:
+        return Path(root) / "text.pt"
+    return default_path(0, mixer=TEXT_GROUP).with_name("text.pt")
 
 
 def layer_paths(layer: int, kind: str, root: str | None = None) -> dict[str, str]:
@@ -233,6 +249,61 @@ def fetch_layer(
         out[name] = (
             torch.frombuffer(raw, dtype=_SAFETENSOR_DTYPES[info["dtype"]]).reshape(info["shape"]).clone()
         )
+    return out
+
+
+def fetch_text(
+    repo: str = BF16_REPO,
+    revision: str = BF16_REVISION,
+    log: Callable[[str], None] = print,
+) -> dict[str, torch.Tensor]:
+    """Fetch the embedding table, the model's final norm and the LM head by HTTP range.
+
+    Unlike `fetch_layer` these three are not one module in one shard, so they are looked up
+    by name and fetched a shard at a time. One range request is issued per contiguous run,
+    and each run's blob is released before the next is read: the two vocabulary-sized
+    tensors are 2.37 GiB each and holding both at once is 4.8 GiB of host memory for no
+    reason.
+    """
+    base = f"https://huggingface.co/{repo}/resolve/{revision}/"
+    index = json.loads(_get(base + "model.safetensors.index.json"))["weight_map"]
+    missing = [name for name in TEXT_TENSORS.values() if name not in index]
+    if missing:
+        raise RuntimeError(f"not in the index at revision {revision[:8]}: {missing}")
+    by_shard: dict[str, list[str]] = {}
+    for name in TEXT_TENSORS.values():
+        by_shard.setdefault(index[name], []).append(name)
+
+    short = {full: key for key, full in TEXT_TENSORS.items()}
+    out = {}
+    for shard, names in sorted(by_shard.items()):
+        header_len = struct.unpack("<Q", _get(base + shard, (0, 7)))[0]
+        header = json.loads(_get(base + shard, (8, 8 + header_len - 1)))
+        entries = {name: header[name] for name in names}
+        ordered = sorted(entries.items(), key=lambda kv: kv[1]["data_offsets"][0])
+        runs: list[list[int]] = []
+        for _, info in ordered:
+            start, end = info["data_offsets"]
+            if runs and start - runs[-1][1] <= _FETCH_GAP:
+                runs[-1][1] = max(runs[-1][1], end)
+            else:
+                runs.append([start, end])
+        fetched = sum(hi - lo for lo, hi in runs)
+        log(f"[weights] {shard}: {len(entries)} tensor(s), {fetched / 2**20:.1f} MiB in "
+            f"{len(runs)} range request(s) at revision {revision[:8]}")
+        data_start = 8 + header_len
+        for lo, hi in runs:
+            blob = _get(base + shard, (data_start + lo, data_start + hi - 1))
+            for name, info in entries.items():
+                start, end = info["data_offsets"]
+                if not (lo <= start and end <= hi):
+                    continue
+                raw = bytearray(blob[start - lo : end - lo])
+                dtype = _SAFETENSOR_DTYPES[info["dtype"]]
+                tensor = torch.frombuffer(raw, dtype=dtype).reshape(info["shape"]).clone()
+                out[short[name]] = tensor
+                log(f"[weights]   {short[name]:<14} {tuple(tensor.shape)} {tensor.dtype}")
+            del blob
     return out
 
 
@@ -654,8 +725,9 @@ def main() -> int:
     # Legacy one-layer options retained for Q0-Q4 validation.
     parser.add_argument("--fetch", action="store_true", help="download one official BF16 GDN layer if absent")
     parser.add_argument("--layer", type=int, default=0)
-    parser.add_argument("--mixer", type=str, default="linear_attn", choices=MIXERS,
-                        help="which group of the layer's tensors to fetch: a mixer, the MLP, or the two layer norms")
+    parser.add_argument("--mixer", type=str, default="linear_attn", choices=FETCH_GROUPS,
+                        help="which group to fetch: a mixer, the MLP, the two layer norms, or `text` -- "
+                        "the embedding, the final norm and the LM head, which belong to no layer")
     parser.add_argument("--out", type=str, default=None)
     parser.add_argument("--revision", type=str, default=BF16_REVISION)
     parser.add_argument("--quantize", action="store_true", help="write the legacy layer's Q4 W8A8 form")
@@ -671,6 +743,17 @@ def main() -> int:
         return 0
     if args.verify_index:
         verify_published_contract(revision=args.checkpoint_revision)
+        return 0
+
+    if args.mixer == TEXT_GROUP:
+        out = Path(args.out) if args.out else text_path()
+        if out.is_file() and not args.fetch:
+            print(f"[weights] the non-layer tensors are already on disk ({out})")
+            return 0
+        weights = fetch_text(revision=args.revision)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(weights, out)
+        print(f"[weights] saved to {out}")
         return 0
 
     # Every layer has an MLP and two norms; the two mixers are on the layers their type says.

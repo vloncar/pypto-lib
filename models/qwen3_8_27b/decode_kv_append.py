@@ -31,7 +31,7 @@ sequences cannot share a cache line however their slots fall.
 """
 import pypto.language as pl
 
-from config import QWEN3_8_27B
+from config import KV_PAGE_SIZE, QWEN3_8_27B
 
 # Dynamic shape variables.
 B_DYN = pl.dynamic("B_DYN")                 # decode sequences, one token each
@@ -41,13 +41,11 @@ KVROWS_DYN = pl.dynamic("KVROWS_DYN")       # rows of the page pool
 HKV = QWEN3_8_27B.num_key_value_heads
 D = QWEN3_8_27B.head_dim
 KV_WIDTH = HKV * D                          # one token's K or V, flat
+PAGE = KV_PAGE_SIZE                         # rows per page, the cache's addressing unit
 
 # validation
 # one sequence, then a full padded batch; a task is one sequence.
 DEFAULT_CASES = (1, 16)
-
-# tiling
-PAGE = 128              # rows per page; must match `decode_attention`'s
 
 
 # scheduling: see `rmsnorm.EARLY_RESOLVE`, which carries the note and the measurement

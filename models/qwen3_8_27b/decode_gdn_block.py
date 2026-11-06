@@ -30,9 +30,10 @@ is a choice this file makes rather than one the operators impose -- they take `s
 independently -- and it is what a serving layer would do, since the two pools are allocated
 per sequence together.
 
-**The batch must be a positive multiple of 16** (`decode_vector.check_batch`). Every stage
-here either takes its token tile as a build argument or already has one of 16; the cube's
-M fractal is what sets the number, and padding to it is free.
+Input matrices use a batch padded to a positive multiple of 16. `active_rows` can
+restrict the recurrence to a live prefix; its inactive outputs are zero and its
+inactive state rows remain untouched. Convolution and matrix stages retain the padded
+extent, so callers must still provide distinct scratch rows for inactive tokens.
 
 What differs from the prefill block beyond the two recurrences: there is no convolution halo,
 because the window's history comes from `conv_state` rather than from zero rows above a
@@ -87,10 +88,15 @@ def run_config(backend_type: str = "a2a3", sim: bool = False, device: int = 0,
                 enable_chip_swimlane=swimlane)
 
 
-def build_kernel(batch: int, head_tile: int = HEAD_TILE, inline: bool = False):
+def build_kernel(batch: int, head_tile: int = HEAD_TILE, inline: bool = False, active_rows: int = 0):
     """The block at one decode batch, composing nine operators as inlined callees."""
     m = padded_batch(batch)
     check_batch(m)
+    rows = active_rows or m
+    if not 1 <= rows <= m:
+        raise ValueError("active_rows must be zero or within the padded batch")
+    # Both branches are parsed; even the inactive padding loop needs a positive extent.
+    pad_rows = max(1, m - rows)
     check_tile("AB_M_TILE", AB_M_TILE, m)
     check_tile("GATE_TOK_TILE", GATE_TOK_TILE, m)
 
@@ -148,7 +154,19 @@ def build_kernel(batch: int, head_tile: int = HEAD_TILE, inline: bool = False):
         gate(a_proj, b_proj, a_log, dt_bias, beta, g)
 
         o = pl.create_tensor([m, H, D], dtype=pl.FP16)
-        delta(q_conv, k_conv, v_conv, beta, g, state, state_rows, o)
+        if rows < m:
+            o_rows = pl.reshape(o, [m, CV])
+            for row in pl.spmd(pad_rows, name_hint="decode_recurrence_pad"):
+                start = rows + row
+                o_rows[start : start + 1, 0:CV] = pl.full([1, CV], value=0.0, dtype=pl.FP16)
+        q_live = q_conv[0:rows, 0:HG, 0:D]
+        k_live = k_conv[0:rows, 0:HG, 0:D]
+        v_live = v_conv[0:rows, 0:H, 0:D]
+        beta_live = beta[0:rows, 0:H]
+        g_live = g[0:rows, 0:H]
+        state_rows_live = state_rows[0:rows]
+        o_live = o[0:rows, 0:H, 0:D]
+        delta(q_live, k_live, v_live, beta_live, g_live, state, state_rows_live, o_live)
 
         y = pl.create_tensor([m, CV], dtype=pl.BF16)
         norm(o, z, norm_w, y)
@@ -229,7 +247,7 @@ def build_tensor_specs(batch: int = 16, pool_rows: int | None = None,
     ]
 
 
-def golden_decode_gdn_block(weights: str | None = None):
+def golden_decode_gdn_block(weights: str | None = None, active_rows: int = 0):
     """The fake-quant chain in float64: `reference.recurrent_block`, one call per sequence.
 
     `quant_y` is off and `out_proj` is not in the quantised set, because the deployed
@@ -268,9 +286,12 @@ def golden_decode_gdn_block(weights: str | None = None):
                 state=decode_delta_rule.golden_state_to_kv(tensors["state"][row].double()),
                 quant_x=True, quant_y=False,
             )
-            out[i] = r["out"][0]
             conv_out[row] = r["conv_state_out"]
-            state_out[row] = decode_delta_rule.golden_state_from_kv(r["state_out"])
+            if active_rows == 0 or i < active_rows:
+                out[i] = r["out"][0]
+                state_out[row] = decode_delta_rule.golden_state_from_kv(r["state_out"])
+            else:
+                out[i].zero_()
         tensors["out"].copy_(out.to(tensors["out"].dtype))
         tensors["conv_state"].copy_(conv_out.to(tensors["conv_state"].dtype))
         tensors["state"].copy_(state_out.to(tensors["state"].dtype))
@@ -344,12 +365,16 @@ MAX_VS_GOLDEN = 1.00
 MAX_ROW_VS_GOLDEN = 1.50
 
 
-def compare_out(batch: int, weights: str | None):
+def compare_out(batch: int, weights: str | None, active_rows: int = 0):
     """The composed decode block against the float64 truth, beside what W8A8 alone costs."""
     def compare(actual, expected, **_kwargs):
         truth = _truth(batch, weights, quant=False)["out"]
         fq = _truth(batch, weights, quant=True)["out"]
         dev = actual.double()
+        if active_rows:
+            if bool(actual[active_rows:].count_nonzero()):
+                return False, "inactive GDN output rows must be zero"
+            truth, fq, dev = truth[:active_rows], fq[:active_rows], dev[:active_rows]
 
         def rel(a, b):
             return float((a - b).norm() / b.norm())
@@ -403,6 +428,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch", type=int, default=None,
                         help="one shape instead of DEFAULT_CASES")
     parser.add_argument("--head-tile", type=int, default=HEAD_TILE)
+    parser.add_argument("--active-rows", type=int, default=0, help="live recurrence rows; zero uses all rows")
     parser.add_argument("--weights", type=str, default=None,
                         help="one layer's BF16 linear_attn tensors; default: random weights")
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -414,10 +440,10 @@ if __name__ == "__main__":
     for batch in cases:
         print(f"[case] decode_gdn_block batch={batch}", flush=True)
         result = run(
-            fn=build_kernel(batch, head_tile=args.head_tile),
+            fn=build_kernel(batch, head_tile=args.head_tile, active_rows=args.active_rows),
             specs=build_tensor_specs(batch=batch, weights=args.weights),
-            golden_fn=golden_decode_gdn_block(args.weights),
-            compare_fn={"out": compare_out(batch, args.weights),
+            golden_fn=golden_decode_gdn_block(args.weights, active_rows=args.active_rows),
+            compare_fn={"out": compare_out(batch, args.weights, active_rows=args.active_rows),
                         "conv_state": compare_pool("conv_state"),
                         "state": compare_pool("state")},
             config=run_config(args.backend_type, args.execution_mode, args.device,
